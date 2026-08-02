@@ -1,0 +1,20 @@
+nitro-control (universal)
+=========================
+
+Install on ANY Kali Linux:
+  sudo dpkg -i nitro-control_2.0.0_all.deb
+  sudo apt-get install -f -y
+
+First steps:
+  nitro-fan probe          # detect hardware
+  nitro-fan-gui            # GUI always works (monitor)
+  sudo nitro-fan install-nbfc   # if you want fan control
+  sudo nitro-fan install-rgb    # Acer Nitro/Predator RGB only
+
+Support matrix:
+  Any Kali laptop     → GUI: temp, RAM, SSD heat
+  NBFC-supported model → fan auto/manual
+  Acer Nitro/Predator  → keyboard RGB (after install-rgb)
+
+Probe example:
+  nitro-fan probe

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Nitro Control
+Name[uz]=Nitro Boshqaruv
+GenericName=Laptop Fan & RGB Control
+Comment=Universal Kali laptop fan, RGB and system monitor
+Comment[uz]=Kali noutbuk fan, RGB va monitor
+Exec=nitro-fan-gui
+Icon=nitro-fan-control
+Terminal=false
+Categories=Utility;System;Settings;HardwareSettings;
+Keywords=fan;cooler;nitro;acer;nbfc;temperature;rgb;keyboard;kali;laptop;
+StartupNotify=true

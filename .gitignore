@@ -1,0 +1,11 @@
+dist/
+**/__pycache__/
+*.pyc
+*.ko
+*.o
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+*.log
+.DS_Store

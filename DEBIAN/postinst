@@ -1,0 +1,90 @@
+#!/bin/bash
+set -e
+
+DETECT="/usr/lib/nitro-control/hw-detect.sh"
+
+case "$1" in
+  configure)
+    # Desktop / icons
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+
+    MANUFACTURER=""; PRODUCT=""; NBFC_CONFIG=""; FAN_SUPPORTED=0
+    RGB_SUPPORTED=0; PROFILE="monitor_only"; IS_ACER=0
+    if [[ -x "$DETECT" ]]; then
+      # shellcheck disable=SC1090
+      eval "$("$DETECT" 2>/dev/null)" || true
+    fi
+
+    echo
+    echo "=========================================="
+    echo " nitro-control o’rnatildi (universal Kali)"
+    echo " Model : ${PRODUCT:-noma’lum}"
+    echo " Profil: ${PROFILE:-monitor_only}"
+    echo "=========================================="
+
+    # Only write nbfc config if we know the model and nbfc exists
+    if command -v nbfc >/dev/null 2>&1 && [[ -n "${NBFC_CONFIG:-}" ]]; then
+      mkdir -p /etc/nbfc
+      if [[ ! -f /etc/nbfc/nbfc.json ]]; then
+        cat > /etc/nbfc/nbfc.json <<EOF
+{
+  "SelectedConfigId": "$NBFC_CONFIG",
+  "EmbeddedControllerType": "dev_port"
+}
+EOF
+      fi
+      nbfc config --set "$NBFC_CONFIG" 2>/dev/null || true
+      if systemctl list-unit-files nbfc_service.service &>/dev/null; then
+        systemctl enable nbfc_service.service 2>/dev/null || true
+        systemctl restart nbfc_service.service 2>/dev/null || true
+        nbfc set -a 2>/dev/null || true
+      fi
+      echo " Fan config: $NBFC_CONFIG"
+    else
+      echo " Fan: avto-config yo’q yoki nbfc yo’q"
+      echo "   sudo nitro-fan install-nbfc"
+      echo "   nitro-fan probe"
+    fi
+
+    # GRUB only on Acer (optional, non-fatal)
+    GRUB_FILE="/etc/default/grub"
+    if [[ ${IS_ACER:-0} -eq 1 && -f "$GRUB_FILE" ]]; then
+      if ! grep -q 'acer_wmi.predator_v4=1' "$GRUB_FILE" 2>/dev/null; then
+        cp -a "$GRUB_FILE" "${GRUB_FILE}.bak.nitro-control" 2>/dev/null || true
+        sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT="|GRUB_CMDLINE_LINUX_DEFAULT="acer_wmi.predator_v4=1 ec_sys.write_support=1 |' "$GRUB_FILE" 2>/dev/null || true
+        # dedupe
+        python3 - <<'PY' 2>/dev/null || true
+import re
+path="/etc/default/grub"
+try:
+    text=open(path).read()
+except Exception:
+    raise SystemExit
+def dedupe(m):
+    body=m.group(2).split(); seen=set(); out=[]
+    for t in body:
+        if t in seen: continue
+        seen.add(t); out.append(t)
+    return m.group(1)+" ".join(out)+m.group(3)
+text2=re.sub(r'^(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)(")$', dedupe, text, flags=re.M)
+if text2!=text: open(path,"w").write(text2)
+PY
+        update-grub >/dev/null 2>&1 || true
+        echo " GRUB: Acer parametrlari (reboot tavsiya)"
+      fi
+    fi
+
+    echo
+    echo "  nitro-fan probe     # model / imkoniyatlar"
+    echo "  nitro-fan-gui       # GUI (barcha Kali)"
+    echo "  nitro-fan status"
+    echo "=========================================="
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+# Keep nbfc running; only our helper package is being removed.
+exit 0

@@ -1,0 +1,27 @@
+Package: nitro-control
+Version: 2.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Erwin <erwin@local>
+Provides: nitro-acer-fan
+Replaces: nitro-acer-fan
+Conflicts: nitro-acer-fan
+Depends: systemd, python3, python3-pyqt5
+Recommends: curl, ca-certificates, lm-sensors, dmidecode
+Suggests: git, build-essential, linux-headers-amd64
+Description: Universal Kali laptop fan/RGB/monitor control
+ Works on any Kali Linux (or Debian) laptop:
+ .
+  * Auto-detects model via DMI
+  * Fan control via NBFC when a matching config exists
+  * Keyboard RGB on Acer Nitro/Predator (facer module)
+  * Always: temperature, RAM/swap, SSD heat monitor GUI
+ .
+ Commands:
+   nitro-fan probe
+   nitro-fan-gui
+   sudo nitro-fan install-nbfc
+   sudo nitro-fan install-rgb
+ .
+ Formerly: nitro-acer-fan (Acer Nitro AN515-57 focused).

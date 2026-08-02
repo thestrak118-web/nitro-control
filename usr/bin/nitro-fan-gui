@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""Nitro Control — Acer Nitro AN515-57 Fan + Keyboard RGB GUI."""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from PyQt5.QtCore import Qt, QTimer, QPointF, QRectF
+from PyQt5.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPen,
+    QRadialGradient,
+    QPixmap,
+    QPainterPath,
+)
+from PyQt5.QtWidgets import (
+    QApplication,
+    QColorDialog,
+    QComboBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+    QGraphicsDropShadowEffect,
+)
+
+
+# ── Theme ──────────────────────────────────────────────────────────────────
+BG = "#0b0f14"
+PANEL = "#121820"
+PANEL2 = "#18212c"
+BORDER = "#243040"
+ACCENT = "#00e676"
+ACCENT2 = "#00b0ff"
+WARN = "#ffab00"
+HOT = "#ff5252"
+TEXT = "#e8eef5"
+MUTED = "#8a9bb0"
+TRACK = "#2a3544"
+
+DEV_DYN = "/dev/acer-gkbbl-0"
+DEV_STATIC = "/dev/acer-gkbbl-static-0"
+RGB_CLI = "/usr/local/bin/nitro-rgb"
+if not os.path.isfile(RGB_CLI):
+    RGB_CLI = "/opt/turbo-fan/facer_rgb.py"
+if not os.path.isfile(RGB_CLI):
+    RGB_CLI = str(Path.home() / "loyiha/acer-predator-rgb/facer_rgb.py")
+
+
+def run_cmd(args: List[str], timeout: float = 8.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout, check=False
+    )
+
+
+@dataclass
+class FanInfo:
+    name: str = ""
+    temperature: float = 0.0
+    auto: bool = False
+    current: float = 0.0
+    target: float = 0.0
+
+
+@dataclass
+class Status:
+    service_active: bool = False
+    config: str = ""
+    fans: List[FanInfo] = field(default_factory=list)
+    cpu_temp: Optional[float] = None
+    fan1_rpm: Optional[int] = None
+    fan2_rpm: Optional[int] = None
+    error: str = ""
+    rgb_ok: bool = False
+    mem_percent: Optional[float] = None
+    mem_used_gb: Optional[float] = None
+    mem_total_gb: Optional[float] = None
+    swap_percent: Optional[float] = None
+    nvme_temp: Optional[float] = None
+
+
+def parse_nbfc_status(text: str) -> List[FanInfo]:
+    fans: List[FanInfo] = []
+    current: Optional[FanInfo] = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Fan Display Name"):
+            if current:
+                fans.append(current)
+            current = FanInfo(name=line.split(":", 1)[1].strip())
+        elif current is None:
+            continue
+        elif line.startswith("Temperature"):
+            try:
+                current.temperature = float(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("Auto Control Enabled"):
+            current.auto = "true" in line.split(":", 1)[1].strip().lower()
+        elif line.startswith("Current Fan Speed"):
+            try:
+                current.current = float(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("Target Fan Speed"):
+            try:
+                current.target = float(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    if current:
+        fans.append(current)
+    return fans
+
+
+def parse_sensors() -> tuple[Optional[float], Optional[int], Optional[int], Optional[float]]:
+    if not shutil.which("sensors"):
+        return None, None, None, None
+    try:
+        out = run_cmd(["sensors"]).stdout
+    except Exception:
+        return None, None, None, None
+    cpu = fan1 = fan2 = nvme = None
+    m = re.search(r"Package id 0:\s*\+?([0-9.]+)", out)
+    if m:
+        cpu = float(m.group(1))
+    m = re.search(r"fan1:\s*([0-9]+)\s*RPM", out)
+    if m:
+        fan1 = int(m.group(1))
+    m = re.search(r"fan2:\s*([0-9]+)\s*RPM", out)
+    if m:
+        fan2 = int(m.group(1))
+    # NVMe composite temp (often first Composite under nvme)
+    m = re.search(r"nvme-.*\n(?:.*\n)*?Composite:\s*\+?([0-9.]+)", out)
+    if not m:
+        m = re.search(r"Composite:\s*\+?([0-9.]+)", out)
+    if m:
+        nvme = float(m.group(1))
+    return cpu, fan1, fan2, nvme
+
+
+def parse_memory() -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Return mem_percent, used_gb, total_gb, swap_percent."""
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+    except Exception:
+        return None, None, None, None
+    vals: dict[str, int] = {}
+    for line in meminfo.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].endswith(":"):
+            try:
+                vals[parts[0][:-1]] = int(parts[1])  # kB
+            except ValueError:
+                pass
+    total = vals.get("MemTotal")
+    avail = vals.get("MemAvailable")
+    if not total or avail is None:
+        return None, None, None, None
+    used = total - avail
+    mem_pct = 100.0 * used / total
+    used_gb = used / (1024 * 1024)
+    total_gb = total / (1024 * 1024)
+    st = vals.get("SwapTotal", 0)
+    sf = vals.get("SwapFree", 0)
+    swap_pct = 0.0 if st == 0 else 100.0 * (st - sf) / st
+    return mem_pct, used_gb, total_gb, swap_pct
+
+
+def fetch_status() -> Status:
+    st = Status()
+    st.rgb_ok = os.path.exists(DEV_DYN)
+    try:
+        svc = run_cmd(["systemctl", "is-active", "nbfc_service"])
+        st.service_active = svc.stdout.strip() == "active"
+    except Exception:
+        st.service_active = False
+
+    st.mem_percent, st.mem_used_gb, st.mem_total_gb, st.swap_percent = parse_memory()
+
+    if not shutil.which("nbfc"):
+        st.error = "nbfc topilmadi. Terminal: sudo nitro-fan install-nbfc"
+        st.cpu_temp, st.fan1_rpm, st.fan2_rpm, st.nvme_temp = parse_sensors()
+        return st
+
+    try:
+        p = run_cmd(["nbfc", "status", "-a"])
+        if p.returncode != 0 and not p.stdout:
+            p = run_cmd(["nbfc", "status"])
+        text = p.stdout or p.stderr
+        for line in text.splitlines():
+            if "Selected Config Name" in line:
+                st.config = line.split(":", 1)[1].strip()
+        st.fans = parse_nbfc_status(text)
+        if p.returncode != 0 and not st.fans:
+            st.error = (p.stderr or p.stdout or "nbfc status xato").strip()
+    except Exception as e:
+        st.error = str(e)
+
+    st.cpu_temp, st.fan1_rpm, st.fan2_rpm, st.nvme_temp = parse_sensors()
+    return st
+
+
+def nbfc_set_auto() -> Tuple[bool, str]:
+    p = run_cmd(["nbfc", "set", "-a"])
+    if p.returncode != 0:
+        p = run_cmd(["nbfc", "set", "--auto"])
+    return p.returncode == 0, (p.stderr or p.stdout or "").strip()
+
+
+def nbfc_set_speed(percent: int) -> Tuple[bool, str]:
+    p = run_cmd(["nbfc", "set", "-s", str(int(percent))])
+    return p.returncode == 0, (p.stderr or p.stdout or "").strip()
+
+
+def rgb_available() -> bool:
+    return os.path.exists(DEV_DYN) and os.path.exists(DEV_STATIC)
+
+
+def set_static_color(r: int, g: int, b: int, brightness: int = 100) -> Tuple[bool, str]:
+    """All 4 zones static color via character devices."""
+    if not rgb_available():
+        return False, "RGB modul yo'q (/dev/acer-gkbbl-*). turbo-fan service?"
+    try:
+        for zone in range(1, 5):
+            payload = [0] * 4
+            payload[0] = 1 << (zone - 1)
+            payload[1] = max(0, min(255, r))
+            payload[2] = max(0, min(255, g))
+            payload[3] = max(0, min(255, b))
+            with open(DEV_STATIC, "wb") as cd:
+                cd.write(bytes(payload))
+        # enable static mode + brightness
+        dyn = [0] * 16
+        dyn[2] = max(0, min(100, brightness))
+        dyn[9] = 1
+        with open(DEV_DYN, "wb") as cd:
+            cd.write(bytes(dyn))
+        return True, f"RGB: #{r:02X}{g:02X}{b:02X}  b={brightness}"
+    except Exception as e:
+        return False, str(e)
+
+
+def set_effect(
+    mode: int,
+    speed: int = 4,
+    brightness: int = 100,
+    direction: int = 1,
+    r: int = 0,
+    g: int = 255,
+    b: int = 0,
+) -> Tuple[bool, str]:
+    if not rgb_available():
+        return False, "RGB modul yo'q"
+    if mode == 0:
+        return set_static_color(r, g, b, brightness)
+    try:
+        payload = [0] * 16
+        payload[0] = mode
+        payload[1] = max(0, min(255, speed))
+        payload[2] = max(0, min(100, brightness))
+        payload[3] = 8 if mode == 3 else 0
+        payload[4] = direction
+        payload[5] = max(0, min(255, r))
+        payload[6] = max(0, min(255, g))
+        payload[7] = max(0, min(255, b))
+        payload[9] = 1
+        with open(DEV_DYN, "wb") as cd:
+            cd.write(bytes(payload))
+        names = {1: "Breath", 2: "Neon", 3: "Wave", 4: "Shift", 5: "Zoom"}
+        return True, f"Effekt: {names.get(mode, mode)}"
+    except Exception as e:
+        return False, str(e)
+
+
+# ── Widgets ────────────────────────────────────────────────────────────────
+
+class GaugeWidget(QWidget):
+    def __init__(self, title: str = "", unit: str = "°C", max_val: float = 100, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.unit = unit
+        self.max_val = max_val
+        self.value = 0.0
+        self.subtitle = ""
+        self.setMinimumSize(140, 150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_value(self, value: float, subtitle: str = ""):
+        self.value = max(0.0, float(value))
+        self.subtitle = subtitle
+        self.update()
+
+    def _color_for(self, ratio: float) -> QColor:
+        if ratio < 0.45:
+            return QColor(ACCENT)
+        if ratio < 0.7:
+            return QColor(WARN)
+        return QColor(HOT)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        side = min(w, h - 28)
+        cx, cy = w / 2, (h - 10) / 2
+        radius = side / 2 - 10
+        ratio = min(1.0, self.value / self.max_val) if self.max_val else 0
+        color = self._color_for(ratio)
+
+        pen = QPen(QColor(TRACK), 10, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(pen)
+        rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+        start_angle = 225 * 16
+        span = -270 * 16
+        p.drawArc(rect, start_angle, span)
+
+        pen = QPen(color, 10, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(rect, start_angle, int(span * ratio))
+
+        grad = QRadialGradient(cx, cy, radius * 0.7)
+        c = QColor(color)
+        c.setAlpha(35)
+        grad.setColorAt(0, c)
+        grad.setColorAt(1, QColor(0, 0, 0, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawEllipse(QPointF(cx, cy), radius * 0.65, radius * 0.65)
+
+        p.setPen(QColor(TEXT))
+        font = QFont("Sans Serif", 17, QFont.Bold)
+        p.setFont(font)
+        p.drawText(rect.adjusted(0, 8, 0, 0), Qt.AlignCenter, f"{self.value:.0f}{self.unit}")
+
+        p.setPen(QColor(MUTED))
+        p.setFont(QFont("Sans Serif", 9))
+        p.drawText(QRectF(0, h - 22, w, 18), Qt.AlignHCenter | Qt.AlignVCenter, self.title)
+
+        if self.subtitle:
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("Sans Serif", 8))
+            p.drawText(QRectF(0, cy + radius * 0.25, w, 16), Qt.AlignHCenter, self.subtitle)
+
+
+class Card(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 120))
+        self.setGraphicsEffect(shadow)
+
+
+class PillButton(QPushButton):
+    def __init__(self, text: str, kind: str = "primary", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(40)
+        self.setObjectName(f"btn_{kind}")
+
+
+class ColorSwatch(QPushButton):
+    def __init__(self, r: int, g: int, b: int, parent=None):
+        super().__init__(parent)
+        self.rgb = (r, g, b)
+        self.setFixedSize(36, 36)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(
+            f"QPushButton {{ background: rgb({r},{g},{b}); border: 2px solid {BORDER};"
+            f" border-radius: 8px; }}"
+            f"QPushButton:hover {{ border: 2px solid {ACCENT}; }}"
+        )
+
+
+# ── Main window ────────────────────────────────────────────────────────────
+
+class NitroFanWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Nitro Control — Fan + RGB")
+        self.setMinimumSize(760, 620)
+        self.resize(820, 660)
+        self._applying = False
+        self._color = QColor(0, 230, 118)  # nitro green
+        self._last_alert_key = ""
+        self._auto_boosted = False
+        self._build_ui()
+        self._apply_style()
+        self.refresh()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(2000)
+
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(12)
+
+        # Header
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("NITRO CONTROL")
+        title.setObjectName("title")
+        self.lbl_subtitle = QLabel("Kali universal  ·  Fan + RGB + Monitor")
+        self.lbl_subtitle.setObjectName("subtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(self.lbl_subtitle)
+        header.addLayout(title_box)
+        header.addStretch()
+        self.badge = QLabel("● SERVICE")
+        self.badge.setObjectName("badge")
+        self.badge_rgb = QLabel("● RGB")
+        self.badge_rgb.setObjectName("badge")
+        header.addWidget(self.badge)
+        header.addWidget(self.badge_rgb)
+        layout.addLayout(header)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("tabs")
+        tabs.addTab(self._build_fan_tab(), "  🌡  FAN  ")
+        tabs.addTab(self._build_rgb_tab(), "  💡  KLAVIATURA RGB  ")
+        layout.addWidget(tabs, 1)
+
+        self.status_bar = QLabel("Tayyor")
+        self.status_bar.setObjectName("statusbar")
+        layout.addWidget(self.status_bar)
+
+    def _build_fan_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 10, 4, 4)
+        layout.setSpacing(12)
+
+        gauges_card = Card()
+        g_layout = QGridLayout(gauges_card)
+        g_layout.setContentsMargins(12, 12, 12, 6)
+        self.g_cpu = GaugeWidget("CPU TEMP", "°C", 100)
+        self.g_cpu_fan = GaugeWidget("CPU FAN", "%", 100)
+        self.g_gpu_fan = GaugeWidget("GPU FAN", "%", 100)
+        self.g_mode = GaugeWidget("TARGET", "%", 100)
+        g_layout.addWidget(self.g_cpu, 0, 0)
+        g_layout.addWidget(self.g_cpu_fan, 0, 1)
+        g_layout.addWidget(self.g_gpu_fan, 0, 2)
+        g_layout.addWidget(self.g_mode, 0, 3)
+        layout.addWidget(gauges_card)
+
+        info_card = Card()
+        info_l = QHBoxLayout(info_card)
+        info_l.setContentsMargins(16, 10, 16, 10)
+        self.lbl_config = QLabel("Config: —")
+        self.lbl_config.setObjectName("info")
+        self.lbl_rpm = QLabel("RPM: —")
+        self.lbl_rpm.setObjectName("info")
+        self.lbl_mode = QLabel("Rejim: —")
+        self.lbl_mode.setObjectName("info")
+        info_l.addWidget(self.lbl_config)
+        info_l.addStretch()
+        info_l.addWidget(self.lbl_mode)
+        info_l.addStretch()
+        info_l.addWidget(self.lbl_rpm)
+        layout.addWidget(info_card)
+
+        # System / warnings
+        sys_card = Card()
+        sys_l = QVBoxLayout(sys_card)
+        sys_l.setContentsMargins(16, 10, 16, 10)
+        sys_l.setSpacing(6)
+        row = QHBoxLayout()
+        self.lbl_ram = QLabel("RAM: —")
+        self.lbl_ram.setObjectName("info")
+        self.lbl_swap = QLabel("Swap: —")
+        self.lbl_swap.setObjectName("info")
+        self.lbl_nvme = QLabel("SSD: —")
+        self.lbl_nvme.setObjectName("info")
+        row.addWidget(self.lbl_ram)
+        row.addStretch()
+        row.addWidget(self.lbl_swap)
+        row.addStretch()
+        row.addWidget(self.lbl_nvme)
+        sys_l.addLayout(row)
+        self.lbl_alert = QLabel("")
+        self.lbl_alert.setObjectName("alert")
+        self.lbl_alert.setWordWrap(True)
+        self.lbl_alert.setVisible(False)
+        sys_l.addWidget(self.lbl_alert)
+        layout.addWidget(sys_card)
+
+        ctrl = Card()
+        c_layout = QVBoxLayout(ctrl)
+        c_layout.setContentsMargins(16, 14, 16, 14)
+        c_layout.setSpacing(10)
+
+        btns = QHBoxLayout()
+        self.btn_auto = PillButton("AUTO REJIM", "primary")
+        self.btn_max = PillButton("MAX 100%", "danger")
+        self.btn_quiet = PillButton("JIM 25%", "secondary")
+        self.btn_refresh = PillButton("YANGILASH", "ghost")
+        self.btn_auto.clicked.connect(self.on_auto)
+        self.btn_max.clicked.connect(lambda: self.apply_speed(100))
+        self.btn_quiet.clicked.connect(lambda: self.apply_speed(25))
+        self.btn_refresh.clicked.connect(self.refresh)
+        for b in (self.btn_auto, self.btn_max, self.btn_quiet, self.btn_refresh):
+            btns.addWidget(b)
+        c_layout.addLayout(btns)
+
+        slider_row = QHBoxLayout()
+        self.lbl_slider = QLabel("Qo'lda: 50%")
+        self.lbl_slider.setObjectName("slider_label")
+        self.lbl_slider.setMinimumWidth(100)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.setValue(50)
+        self.slider.setTickPosition(QSlider.TicksBelow)
+        self.slider.setTickInterval(10)
+        self.slider.valueChanged.connect(lambda v: self.lbl_slider.setText(f"Qo'lda: {v}%"))
+        self.btn_apply = PillButton("QO'LLASH", "accent")
+        self.btn_apply.setFixedWidth(120)
+        self.btn_apply.clicked.connect(lambda: self.apply_speed(self.slider.value()))
+        slider_row.addWidget(self.lbl_slider)
+        slider_row.addWidget(self.slider, 1)
+        slider_row.addWidget(self.btn_apply)
+        c_layout.addLayout(slider_row)
+        layout.addWidget(ctrl)
+        layout.addStretch()
+        return w
+
+    def _build_rgb_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 10, 4, 4)
+        layout.setSpacing(12)
+
+        # Preview
+        prev = Card()
+        pl = QVBoxLayout(prev)
+        pl.setContentsMargins(16, 14, 16, 14)
+        self.preview = QLabel("  KLAVIATURA RANGI  ")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumHeight(72)
+        self.preview.setObjectName("preview")
+        self._update_preview()
+        pl.addWidget(self.preview)
+
+        sw_row = QHBoxLayout()
+        sw_row.addWidget(QLabel("Tez ranglar:"))
+        presets = [
+            (255, 0, 0), (255, 80, 0), (255, 200, 0), (0, 255, 0),
+            (0, 230, 118), (0, 200, 255), (0, 80, 255), (180, 0, 255),
+            (255, 0, 180), (255, 255, 255),
+        ]
+        for rgb in presets:
+            sw = ColorSwatch(*rgb)
+            sw.clicked.connect(lambda _=False, c=rgb: self._pick_preset(*c))
+            sw_row.addWidget(sw)
+        sw_row.addStretch()
+        self.btn_picker = PillButton("RANG TANLASH…", "secondary")
+        self.btn_picker.clicked.connect(self.on_color_picker)
+        sw_row.addWidget(self.btn_picker)
+        pl.addLayout(sw_row)
+        layout.addWidget(prev)
+
+        # Effects
+        eff = Card()
+        el = QVBoxLayout(eff)
+        el.setContentsMargins(16, 14, 16, 14)
+        el.setSpacing(10)
+        el.addWidget(QLabel("Effektlar (Windows Nitro Sense kabi):"))
+
+        modes = QHBoxLayout()
+        self.btn_static = PillButton("STATIC", "primary")
+        self.btn_breath = PillButton("BREATH", "secondary")
+        self.btn_neon = PillButton("NEON", "secondary")
+        self.btn_wave = PillButton("WAVE", "secondary")
+        self.btn_shift = PillButton("SHIFT", "secondary")
+        self.btn_zoom = PillButton("ZOOM", "secondary")
+        self.btn_off = PillButton("O'CHIRISH", "danger")
+        self.btn_static.clicked.connect(self.on_static)
+        self.btn_breath.clicked.connect(lambda: self.on_effect(1))
+        self.btn_neon.clicked.connect(lambda: self.on_effect(2))
+        self.btn_wave.clicked.connect(lambda: self.on_effect(3))
+        self.btn_shift.clicked.connect(lambda: self.on_effect(4))
+        self.btn_zoom.clicked.connect(lambda: self.on_effect(5))
+        self.btn_off.clicked.connect(self.on_rgb_off)
+        for b in (
+            self.btn_static, self.btn_breath, self.btn_neon,
+            self.btn_wave, self.btn_shift, self.btn_zoom, self.btn_off,
+        ):
+            modes.addWidget(b)
+        el.addLayout(modes)
+
+        # Brightness / speed
+        sl = QHBoxLayout()
+        self.lbl_bri = QLabel("Yorqinlik: 100")
+        self.lbl_bri.setMinimumWidth(110)
+        self.sld_bri = QSlider(Qt.Horizontal)
+        self.sld_bri.setRange(0, 100)
+        self.sld_bri.setValue(100)
+        self.sld_bri.valueChanged.connect(lambda v: self.lbl_bri.setText(f"Yorqinlik: {v}"))
+        sl.addWidget(self.lbl_bri)
+        sl.addWidget(self.sld_bri, 1)
+        el.addLayout(sl)
+
+        sl2 = QHBoxLayout()
+        self.lbl_spd = QLabel("Tezlik: 4")
+        self.lbl_spd.setMinimumWidth(110)
+        self.sld_spd = QSlider(Qt.Horizontal)
+        self.sld_spd.setRange(1, 9)
+        self.sld_spd.setValue(4)
+        self.sld_spd.valueChanged.connect(lambda v: self.lbl_spd.setText(f"Tezlik: {v}"))
+        sl2.addWidget(self.lbl_spd)
+        sl2.addWidget(self.sld_spd, 1)
+        el.addLayout(sl2)
+
+        tip = QLabel(
+            "Maslahat: STATIC = doimiy rang · NEON/WAVE = animatsiya · "
+            "Agar RGB ishlamasa: sudo systemctl restart turbo-fan"
+        )
+        tip.setObjectName("tip")
+        tip.setWordWrap(True)
+        el.addWidget(tip)
+        layout.addWidget(eff)
+        layout.addStretch()
+        return w
+
+    def _update_preview(self):
+        c = self._color
+        self.preview.setStyleSheet(
+            f"QLabel#preview {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            f" stop:0 rgb({c.red()//3},{c.green()//3},{c.blue()//3}),"
+            f" stop:0.5 rgb({c.red()},{c.green()},{c.blue()}),"
+            f" stop:1 rgb({c.red()//3},{c.green()//3},{c.blue()//3}));"
+            f" color: white; font-size: 16px; font-weight: 800; letter-spacing: 2px;"
+            f" border-radius: 12px; border: 1px solid {BORDER}; padding: 18px; }}"
+        )
+
+    def _pick_preset(self, r: int, g: int, b: int):
+        self._color = QColor(r, g, b)
+        self._update_preview()
+        self.on_static()
+
+    def on_color_picker(self):
+        c = QColorDialog.getColor(self._color, self, "Klaviatura rangi")
+        if c.isValid():
+            self._color = c
+            self._update_preview()
+            self.on_static()
+
+    def on_static(self):
+        c = self._color
+        ok, msg = set_static_color(c.red(), c.green(), c.blue(), self.sld_bri.value())
+        self.set_status(msg, ok)
+
+    def on_effect(self, mode: int):
+        c = self._color
+        ok, msg = set_effect(
+            mode,
+            speed=self.sld_spd.value(),
+            brightness=self.sld_bri.value(),
+            r=c.red(),
+            g=c.green(),
+            b=c.blue(),
+        )
+        self.set_status(msg, ok)
+
+    def on_rgb_off(self):
+        ok, msg = set_static_color(0, 0, 0, 0)
+        # also force brightness 0 dynamic
+        if rgb_available():
+            try:
+                payload = [0] * 16
+                payload[2] = 0
+                payload[9] = 1
+                with open(DEV_DYN, "wb") as cd:
+                    cd.write(bytes(payload))
+            except Exception:
+                pass
+        self.set_status("Klaviatura RGB o'chirildi" if ok else msg, ok)
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            f"""
+            QMainWindow, QWidget {{
+                background: {BG}; color: {TEXT};
+                font-family: 'Segoe UI', 'Ubuntu', 'Noto Sans', sans-serif;
+                font-size: 13px;
+            }}
+            QLabel#title {{
+                font-size: 22px; font-weight: 800; letter-spacing: 1.5px; color: {TEXT};
+            }}
+            QLabel#subtitle {{ color: {MUTED}; font-size: 12px; }}
+            QLabel#badge {{
+                background: {PANEL2}; border: 1px solid {BORDER}; border-radius: 14px;
+                padding: 6px 12px; font-weight: 700; font-size: 11px; color: {MUTED};
+            }}
+            QFrame#card {{
+                background: {PANEL}; border: 1px solid {BORDER}; border-radius: 16px;
+            }}
+            QLabel#info {{ color: {MUTED}; font-size: 12px; }}
+            QLabel#slider_label {{ font-weight: 600; color: {TEXT}; }}
+            QLabel#tip {{ color: {MUTED}; font-size: 11px; }}
+            QLabel#alert {{
+                background: #3a1515; color: {HOT}; border: 1px solid {HOT};
+                border-radius: 10px; padding: 8px 12px; font-weight: 700; font-size: 12px;
+            }}
+            QLabel#statusbar {{ color: {MUTED}; font-size: 11px; padding: 2px 4px; }}
+            QTabWidget::pane {{
+                border: 1px solid {BORDER}; border-radius: 12px; background: {BG};
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background: {PANEL2}; color: {MUTED}; padding: 10px 18px;
+                margin-right: 4px; border-top-left-radius: 10px; border-top-right-radius: 10px;
+                border: 1px solid {BORDER}; font-weight: 700;
+            }}
+            QTabBar::tab:selected {{
+                background: {PANEL}; color: {ACCENT}; border-bottom-color: {PANEL};
+            }}
+            QPushButton#btn_primary {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {ACCENT}, stop:1 #00c853);
+                color: #04120a; border: none; border-radius: 12px; font-weight: 800; padding: 8px 12px;
+            }}
+            QPushButton#btn_primary:hover {{ background: #69f0ae; }}
+            QPushButton#btn_danger {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #ff5252, stop:1 #ff1744);
+                color: white; border: none; border-radius: 12px; font-weight: 800; padding: 8px 12px;
+            }}
+            QPushButton#btn_danger:hover {{ background: #ff8a80; color: #2a0000; }}
+            QPushButton#btn_secondary {{
+                background: {PANEL2}; color: {ACCENT2}; border: 1px solid {ACCENT2};
+                border-radius: 12px; font-weight: 700; padding: 8px 12px;
+            }}
+            QPushButton#btn_secondary:hover {{ background: #1c2a38; }}
+            QPushButton#btn_ghost {{
+                background: transparent; color: {MUTED}; border: 1px solid {BORDER};
+                border-radius: 12px; font-weight: 600; padding: 8px 12px;
+            }}
+            QPushButton#btn_ghost:hover {{ color: {TEXT}; border-color: {MUTED}; }}
+            QPushButton#btn_accent {{
+                background: {ACCENT2}; color: #041018; border: none;
+                border-radius: 12px; font-weight: 800; padding: 8px 12px;
+            }}
+            QPushButton#btn_accent:hover {{ background: #40c4ff; }}
+            QSlider::groove:horizontal {{
+                height: 8px; background: {TRACK}; border-radius: 4px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 18px; height: 18px; margin: -6px 0;
+                background: {ACCENT}; border-radius: 9px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {ACCENT2}, stop:1 {ACCENT});
+                border-radius: 4px;
+            }}
+            """
+        )
+
+    def set_status(self, msg: str, ok: bool = True):
+        color = ACCENT if ok else HOT
+        self.status_bar.setText(msg)
+        self.status_bar.setStyleSheet(f"color: {color}; font-size: 11px; padding: 2px 4px;")
+
+    def _update_model_subtitle(self):
+        """Show DMI model once; non-fatal if missing."""
+        if getattr(self, "_model_set", False):
+            return
+        model = ""
+        for path in (
+            "/sys/class/dmi/id/product_name",
+            "/sys/class/dmi/id/sys_vendor",
+        ):
+            try:
+                model = (model + " " + Path(path).read_text().strip()).strip()
+            except Exception:
+                pass
+        if model:
+            rgb = "RGB+" if os.path.exists(DEV_DYN) else "monitor"
+            self.lbl_subtitle.setText(f"{model}  ·  Kali universal ({rgb})")
+            self._model_set = True
+
+    def refresh(self):
+        if self._applying:
+            return
+        st = fetch_status()
+        self._update_model_subtitle()
+
+        if st.service_active:
+            self.badge.setText("● FAN OK")
+            self.badge.setStyleSheet(
+                f"background:{PANEL2};border:1px solid {ACCENT};border-radius:14px;"
+                f"padding:6px 12px;font-weight:700;font-size:11px;color:{ACCENT};"
+            )
+        else:
+            self.badge.setText("● FAN OFF")
+            self.badge.setStyleSheet(
+                f"background:{PANEL2};border:1px solid {HOT};border-radius:14px;"
+                f"padding:6px 12px;font-weight:700;font-size:11px;color:{HOT};"
+            )
+
+        if st.rgb_ok:
+            self.badge_rgb.setText("● RGB OK")
+            self.badge_rgb.setStyleSheet(
+                f"background:{PANEL2};border:1px solid {ACCENT2};border-radius:14px;"
+                f"padding:6px 12px;font-weight:700;font-size:11px;color:{ACCENT2};"
+            )
+        else:
+            self.badge_rgb.setText("● RGB YO'Q")
+            self.badge_rgb.setStyleSheet(
+                f"background:{PANEL2};border:1px solid {HOT};border-radius:14px;"
+                f"padding:6px 12px;font-weight:700;font-size:11px;color:{HOT};"
+            )
+
+        cpu = st.cpu_temp
+        if cpu is None and st.fans:
+            cpu = st.fans[0].temperature
+        self.g_cpu.set_value(cpu or 0, "Package" if st.cpu_temp else "NBFC")
+
+        cpu_fan = st.fans[0] if len(st.fans) > 0 else None
+        gpu_fan = st.fans[1] if len(st.fans) > 1 else None
+        if cpu_fan:
+            self.g_cpu_fan.set_value(cpu_fan.current, f"→ {cpu_fan.target:.0f}%")
+        if gpu_fan:
+            self.g_gpu_fan.set_value(gpu_fan.current, f"→ {gpu_fan.target:.0f}%")
+
+        target, auto = 0.0, False
+        if cpu_fan:
+            target, auto = cpu_fan.target, cpu_fan.auto
+        self.g_mode.set_value(target, "AUTO" if auto else "MANUAL")
+
+        self.lbl_config.setText(f"Config: {st.config or '—'}")
+        self.lbl_mode.setText(
+            f"Rejim: {'AUTO (temp)' if auto else 'MANUAL'}"
+        )
+        rpm_parts = []
+        if st.fan1_rpm is not None:
+            rpm_parts.append(f"CPU {st.fan1_rpm}")
+        if st.fan2_rpm is not None:
+            rpm_parts.append(f"GPU {st.fan2_rpm}")
+        self.lbl_rpm.setText("RPM: " + (" · ".join(rpm_parts) if rpm_parts else "—"))
+
+        # RAM / SSD labels
+        if st.mem_percent is not None:
+            self.lbl_ram.setText(
+                f"RAM: {st.mem_percent:.0f}%  ({st.mem_used_gb:.1f}/{st.mem_total_gb:.0f} GB)"
+            )
+            if st.mem_percent >= 90:
+                self.lbl_ram.setStyleSheet(f"color: {HOT}; font-weight: 700;")
+            elif st.mem_percent >= 80:
+                self.lbl_ram.setStyleSheet(f"color: {WARN}; font-weight: 700;")
+            else:
+                self.lbl_ram.setStyleSheet(f"color: {MUTED};")
+        if st.swap_percent is not None:
+            self.lbl_swap.setText(f"Swap: {st.swap_percent:.0f}%")
+            if st.swap_percent >= 50:
+                self.lbl_swap.setStyleSheet(f"color: {HOT}; font-weight: 700;")
+            elif st.swap_percent >= 20:
+                self.lbl_swap.setStyleSheet(f"color: {WARN}; font-weight: 700;")
+            else:
+                self.lbl_swap.setStyleSheet(f"color: {MUTED};")
+        if st.nvme_temp is not None:
+            self.lbl_nvme.setText(f"SSD: {st.nvme_temp:.0f}°C")
+            if st.nvme_temp >= 75:
+                self.lbl_nvme.setStyleSheet(f"color: {HOT}; font-weight: 700;")
+            elif st.nvme_temp >= 65:
+                self.lbl_nvme.setStyleSheet(f"color: {WARN}; font-weight: 700;")
+            else:
+                self.lbl_nvme.setStyleSheet(f"color: {MUTED};")
+        else:
+            self.lbl_nvme.setText("SSD: —")
+
+        self._handle_alerts(st)
+
+        if st.error:
+            self.set_status(st.error, ok=False)
+
+    def _handle_alerts(self, st: Status):
+        warnings: List[str] = []
+        critical = False
+        if st.mem_percent is not None and st.mem_percent >= 90:
+            warnings.append(f"RAM {st.mem_percent:.0f}% to'ldi — og'ir dasturlarni yoping")
+            critical = True
+        elif st.mem_percent is not None and st.mem_percent >= 80:
+            warnings.append(f"RAM {st.mem_percent:.0f}% — yuqori")
+        if st.swap_percent is not None and st.swap_percent >= 40:
+            warnings.append(f"Swap {st.swap_percent:.0f}% — SSD zo'riqyapti")
+            critical = True
+        if st.cpu_temp is not None and st.cpu_temp >= 90:
+            warnings.append(f"CPU {st.cpu_temp:.0f}°C — juda issiq")
+            critical = True
+        elif st.cpu_temp is not None and st.cpu_temp >= 80:
+            warnings.append(f"CPU {st.cpu_temp:.0f}°C — issiq")
+        if st.nvme_temp is not None and st.nvme_temp >= 75:
+            warnings.append(f"SSD {st.nvme_temp:.0f}°C — xavfli issiqlik")
+            critical = True
+
+        if warnings:
+            self.lbl_alert.setText("⚠  " + "  ·  ".join(warnings))
+            self.lbl_alert.setVisible(True)
+            key = "|".join(warnings)
+            if critical and key != self._last_alert_key:
+                self._last_alert_key = key
+                self.set_status(warnings[0], ok=False)
+                # Auto boost fans once per alert wave
+                if not self._auto_boosted and shutil.which("nbfc"):
+                    nbfc_set_speed(100)
+                    self._auto_boosted = True
+                    self.set_status(warnings[0] + "  → fan 100%", ok=False)
+        else:
+            self.lbl_alert.setVisible(False)
+            self.lbl_alert.setText("")
+            if self._auto_boosted:
+                # cool enough — back to auto
+                nbfc_set_auto()
+                self._auto_boosted = False
+                self._last_alert_key = ""
+                self.set_status("Normal — fan AUTO", ok=True)
+
+    def on_auto(self):
+        self._applying = True
+        ok, err = nbfc_set_auto()
+        self._applying = False
+        self.set_status("AUTO rejim" if ok else f"Xato: {err}", ok)
+        if not ok:
+            QMessageBox.warning(self, "Xato", err or "auto ishlamadi")
+        self.refresh()
+
+    def apply_speed(self, percent: int):
+        self._applying = True
+        ok, err = nbfc_set_speed(percent)
+        self._applying = False
+        self.slider.setValue(percent)
+        self.set_status(f"Fan: {percent}%" if ok else f"Xato: {err}", ok)
+        if not ok:
+            QMessageBox.warning(self, "Xato", err or "set ishlamadi")
+        self.refresh()
+
+
+def make_app_icon() -> QIcon:
+    pm = QPixmap(128, 128)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    grad = QRadialGradient(64, 64, 60)
+    grad.setColorAt(0, QColor("#123025"))
+    grad.setColorAt(1, QColor("#0b0f14"))
+    p.setBrush(grad)
+    p.setPen(QPen(QColor(ACCENT), 4))
+    p.drawEllipse(8, 8, 112, 112)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(ACCENT))
+    p.translate(64, 64)
+    for _ in range(3):
+        p.rotate(120)
+        path = QPainterPath()
+        path.moveTo(0, 0)
+        path.cubicTo(18, -8, 36, -28, 12, -42)
+        path.cubicTo(8, -20, 4, -10, 0, 0)
+        p.drawPath(path)
+    p.setBrush(QColor(ACCENT2))
+    p.drawEllipse(-8, -8, 16, 16)
+    p.end()
+    return QIcon(pm)
+
+
+def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    app.setApplicationName("Nitro Control")
+    icon = make_app_icon()
+    app.setWindowIcon(icon)
+    win = NitroFanWindow()
+    win.setWindowIcon(icon)
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

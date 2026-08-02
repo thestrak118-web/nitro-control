@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+  purge)
+    # Do not remove /etc/nbfc/nbfc.json by default — user may still use nbfc.
+    # GRUB backups left intentionally.
+    ;;
+esac
+
+exit 0

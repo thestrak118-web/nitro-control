@@ -1,0 +1,306 @@
+#!/bin/bash
+# nitro-fan — universal laptop helper for Kali/Debian (NBFC + Acer RGB)
+# Works on any machine: detects model, enables fan/RGB only when supported.
+set -euo pipefail
+
+DETECT="/usr/lib/nitro-control/hw-detect.sh"
+SERVICE="nbfc_service"
+NBFC_BIN="${NBFC_BIN:-/usr/bin/nbfc}"
+
+die() { echo "xato: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "root kerak: sudo nitro-fan $*"; }
+have_nbfc() { command -v nbfc >/dev/null 2>&1 || [[ -x "$NBFC_BIN" ]]; }
+
+load_hw() {
+  MANUFACTURER=""; PRODUCT=""; NBFC_CONFIG=""; FAN_SUPPORTED=0
+  RGB_SUPPORTED=0; RGB_STATUS="unknown"; PROFILE="monitor_only"
+  NBFC_INSTALLED=0; IS_ACER=0; IS_NITRO_PRED=0; RGB_DEV=0; WMI_RGB=0
+  if [[ -x "$DETECT" ]]; then
+    # shellcheck disable=SC1090
+    eval "$("$DETECT")"
+  fi
+  # Fallback config if user already has nbfc.json
+  if [[ -z "${NBFC_CONFIG:-}" && -f /etc/nbfc/nbfc.json ]]; then
+    NBFC_CONFIG="$(python3 -c "import json;print(json.load(open('/etc/nbfc/nbfc.json')).get('SelectedConfigId',''))" 2>/dev/null || true)"
+  fi
+}
+
+cmd_probe() {
+  load_hw
+  cat <<EOF
+=== Nitro Control — apparat aniqlash ===
+Ishlab chiqaruvchi : ${MANUFACTURER:-?}
+Model              : ${PRODUCT:-?}
+Profil             : ${PROFILE:-?}
+
+Fan (NBFC)
+  o’rnatilgan      : $([[ ${NBFC_INSTALLED:-0} -eq 1 ]] && echo ha || echo yoq)
+  config           : ${NBFC_CONFIG:-topilmadi}
+  qo’llab-quvvatlash: $([[ ${FAN_SUPPORTED:-0} -eq 1 ]] && echo ha || echo yoq — umumiy monitor rejimi)
+
+RGB (klaviatura)
+  Acer gaming      : $([[ ${IS_NITRO_PRED:-0} -eq 1 ]] && echo ha || echo yoq)
+  WMI RGB          : $([[ ${WMI_RGB:-0} -eq 1 ]] && echo ha || echo yoq)
+  /dev/acer-gkbbl  : $([[ ${RGB_DEV:-0} -eq 1 ]] && echo ha || echo yoq)
+  holat            : ${RGB_STATUS:-?}
+  qo’llab-quvvatlash: $([[ ${RGB_SUPPORTED:-0} -eq 1 ]] && echo ha || echo yoq)
+
+Maslahat:
+EOF
+  if [[ ${NBFC_INSTALLED:-0} -eq 0 ]]; then
+    echo "  sudo nitro-fan install-nbfc   # fan dasturi"
+  fi
+  if [[ ${FAN_SUPPORTED:-0} -eq 1 ]]; then
+    echo "  sudo nitro-fan enable        # fan config + service"
+  else
+    echo "  Bu model uchun NBFC config yo’q — faqat temp/RAM monitor."
+    echo "  Qo’llab-quvvatlash: https://github.com/nbfc-linux/nbfc-linux"
+  fi
+  if [[ ${RGB_STATUS:-} == "needs_facer" ]]; then
+    echo "  RGB uchun facer modul: sudo nitro-fan install-rgb"
+  fi
+  if [[ ${RGB_DEV:-0} -eq 1 ]]; then
+    echo "  GUI: nitro-fan-gui  (klaviatura RGB tab)"
+  fi
+}
+
+cmd_status() {
+  load_hw
+  echo "model: ${PRODUCT:-?} (${MANUFACTURER:-?})"
+  echo "profile: ${PROFILE:-?}"
+  if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+    echo "nbfc service: active"
+  else
+    echo "nbfc service: inactive"
+  fi
+  if have_nbfc; then
+    nbfc status -a 2>/dev/null || nbfc status 2>/dev/null || true
+  else
+    echo "nbfc topilmadi — sudo nitro-fan install-nbfc"
+  fi
+  echo "rgb: ${RGB_STATUS:-?} (dev=$([[ ${RGB_DEV:-0} -eq 1 ]] && echo yes || echo no))"
+  if command -v sensors >/dev/null 2>&1; then
+    echo
+    sensors 2>/dev/null | grep -E 'Package id|Core [0-9]|Composite|fan[0-9]|acer-isa' || true
+  fi
+  # quick mem
+  if [[ -r /proc/meminfo ]]; then
+    python3 - <<'PY' 2>/dev/null || true
+import re
+t=open("/proc/meminfo").read()
+def k(n):
+ m=re.search(rf"^{n}:\s+(\d+)",t,re.M)
+ return int(m.group(1)) if m else 0
+tot,av=k("MemTotal"),k("MemAvailable")
+if tot:
+ print(f"\nRAM: {(tot-av)/1024/1024:.1f}/{tot/1024/1024:.0f} GB ({100*(tot-av)/tot:.0f}%)")
+PY
+  fi
+}
+
+cmd_auto() {
+  need_root "auto"
+  have_nbfc || die "nbfc yo’q. Avval: sudo nitro-fan install-nbfc"
+  systemctl start "$SERVICE" 2>/dev/null || true
+  nbfc set -a 2>/dev/null || nbfc set --auto || die "auto rejim o’rnatilmadi"
+  echo "Auto rejim yoqildi."
+  nbfc status -a 2>/dev/null || true
+}
+
+cmd_max() {
+  need_root "max"
+  have_nbfc || die "nbfc yo’q"
+  systemctl start "$SERVICE" 2>/dev/null || true
+  nbfc set -s 100 || die "max speed o’rnatilmadi"
+  echo "Fan 100% (max)."
+}
+
+cmd_set() {
+  need_root "set"
+  local pct="${1:-}"
+  [[ -n "$pct" ]] || die "foiz kerak: nitro-fan set 0-100"
+  [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 0 && pct <= 100 )) || die "0-100 oralig’ida bo’lsin"
+  have_nbfc || die "nbfc yo’q"
+  systemctl start "$SERVICE" 2>/dev/null || true
+  nbfc set -s "$pct"
+  echo "Fan: ${pct}%"
+}
+
+cmd_enable() {
+  need_root "enable"
+  load_hw
+  have_nbfc || die "nbfc yo’q. Avval: sudo nitro-fan install-nbfc"
+  local cfg="${NBFC_CONFIG:-}"
+  if [[ -z "$cfg" ]]; then
+    echo "Model: ${PRODUCT:-noma’lum}"
+    echo "NBFC config topilmadi. Mavjud configlar:"
+    nbfc config -l 2>/dev/null | head -30 || ls /usr/share/nbfc/configs 2>/dev/null | head -20
+    die "Qo’lda: nbfc config --set \"Model Name\""
+  fi
+  mkdir -p /etc/nbfc
+  cat > /etc/nbfc/nbfc.json <<EOF
+{
+  "SelectedConfigId": "$cfg",
+  "EmbeddedControllerType": "dev_port"
+}
+EOF
+  nbfc config --set "$cfg" 2>/dev/null || true
+  systemctl enable --now "$SERVICE" 2>/dev/null || true
+  nbfc set -a 2>/dev/null || true
+  echo "NBFC yoqildi: $cfg"
+  cmd_status
+}
+
+cmd_install_nbfc() {
+  need_root "install-nbfc"
+  if have_nbfc; then
+    echo "nbfc allaqachon bor: $(command -v nbfc)"
+    nbfc --version 2>/dev/null || true
+    load_hw
+    if [[ ${FAN_SUPPORTED:-0} -eq 1 ]]; then
+      cmd_enable
+    else
+      echo "Config avto-topilmadi — nitro-fan probe"
+    fi
+    return 0
+  fi
+  local ver="0.5.2"
+  local url="https://github.com/nbfc-linux/nbfc-linux/releases/download/${ver}/debian-trixie-nbfc-linux_${ver}_amd64.deb"
+  local deb="/tmp/nbfc-linux_${ver}_amd64.deb"
+  echo "[*] Yuklanmoqda (har qanday Kali/Debian): $url"
+  command -v curl >/dev/null || die "curl kerak: apt install curl"
+  curl -fsSL -o "$deb" "$url"
+  echo "[*] O’rnatilmoqda..."
+  dpkg -i "$deb" || apt-get install -f -y
+  have_nbfc || die "nbfc o’rnatilmadi"
+  nbfc --version
+  load_hw
+  if [[ ${FAN_SUPPORTED:-0} -eq 1 ]]; then
+    cmd_enable
+  else
+    echo "NBFC o’rnatildi, lekin bu model configi yo’q."
+    echo "  nitro-fan probe"
+    echo "  nbfc config -l | less"
+  fi
+}
+
+cmd_install_rgb() {
+  need_root "install-rgb"
+  load_hw
+  if [[ ${IS_ACER:-0} -ne 1 || ${IS_NITRO_PRED:-0} -ne 1 ]]; then
+    die "RGB faqat Acer Nitro/Predator/Helios uchun. Model: ${PRODUCT:-?}"
+  fi
+  if [[ ${RGB_DEV:-0} -eq 1 ]]; then
+    echo "RGB allaqachon tayyor (/dev/acer-gkbbl-0)"
+    return 0
+  fi
+  local dir="/opt/turbo-fan"
+  if [[ -x "$dir/install.sh" ]]; then
+    bash "$dir/install.sh"
+    return 0
+  fi
+  local src="/tmp/acer-predator-rgb"
+  command -v git >/dev/null || apt-get install -y git
+  command -v make >/dev/null || apt-get install -y build-essential
+  apt-get install -y "linux-headers-$(uname -r)" 2>/dev/null || true
+  rm -rf "$src"
+  git clone --depth 1 \
+    https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module.git \
+    "$src"
+  cd "$src"
+  chmod +x ./*.sh
+  if [[ -x ./install_service.sh ]]; then
+    bash ./install_service.sh
+  else
+    bash ./install.sh
+  fi
+  # helper CLI
+  if [[ -f facer_rgb.py ]]; then
+    cp -f facer_rgb.py /usr/local/bin/nitro-rgb
+    chmod 755 /usr/local/bin/nitro-rgb
+  fi
+  echo "RGB o’rnatildi. Tekshirish: ls -l /dev/acer-gkbbl-0"
+  ls -l /dev/acer-gkbbl* 2>/dev/null || echo "Reboot yoki: systemctl restart turbo-fan"
+}
+
+cmd_grub() {
+  need_root "grub"
+  local grub="/etc/default/grub"
+  [[ -f "$grub" ]] || die "$grub topilmadi"
+  load_hw
+  local params=()
+  # useful on many EC-based laptops
+  params+=("ec_sys.write_support=1")
+  if [[ ${IS_ACER:-0} -eq 1 ]]; then
+    params+=("acer_wmi.predator_v4=1")
+  fi
+  local changed=0
+  cp -a "$grub" "${grub}.bak.nitro-control.$(date +%Y%m%d%H%M%S)"
+  local line val
+  line=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub" || true)
+  [[ -n "$line" ]] || die "GRUB_CMDLINE_LINUX_DEFAULT topilmadi"
+  val=$(echo "$line" | sed -E 's/^GRUB_CMDLINE_LINUX_DEFAULT="(.*)"$/\1/')
+  for p in "${params[@]}"; do
+    if echo " $val " | grep -q " ${p} "; then
+      echo "[*] bor: $p"
+    else
+      val="${p} ${val}"
+      changed=1
+      echo "[+] qo’shildi: $p"
+    fi
+  done
+  if (( changed )); then
+    sed -i -E "s|^GRUB_CMDLINE_LINUX_DEFAULT=\".*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${val}\"|" "$grub"
+    command -v update-grub >/dev/null && update-grub || true
+    echo "GRUB yangilandi — reboot qiling."
+  else
+    echo "O’zgarish yo’q."
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+nitro-fan — universal Kali laptop control (fan + Acer RGB + monitor)
+
+Har qanday Kali da ishlaydi:
+  - model avto-aniqlanadi
+  - fan: NBFC config bo’lsa
+  - RGB: Acer Nitro/Predator + facer modul
+  - boshqa noutbuk: temp/RAM monitor (GUI)
+
+Buyruqlar:
+  nitro-fan probe               Apparatni aniqlash
+  nitro-fan status              Holat
+  sudo nitro-fan install-nbfc   NBFC o’rnatish (barcha Kali)
+  sudo nitro-fan enable         Fan config + service
+  sudo nitro-fan auto|max|set N Fan boshqaruvi
+  sudo nitro-fan install-rgb    Acer RGB modul (faqat Acer gaming)
+  sudo nitro-fan grub           Foydali kernel parametrlari
+  nitro-fan-gui                 Grafik interfeys
+
+Misollar:
+  nitro-fan probe
+  sudo nitro-fan install-nbfc
+  nitro-fan-gui
+EOF
+}
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    probe|p|detect)   cmd_probe ;;
+    status|st)        cmd_status ;;
+    auto|a)           cmd_auto ;;
+    max|m)            cmd_max ;;
+    set|s)            cmd_set "${1:-}" ;;
+    enable|e)         cmd_enable ;;
+    install-nbfc|in)  cmd_install_nbfc ;;
+    install-rgb|ir)   cmd_install_rgb ;;
+    grub|g)           cmd_grub ;;
+    -h|--help|help)   usage ;;
+    *)                usage; die "noma’lum buyruq: $cmd" ;;
+  esac
+}
+
+main "$@"
