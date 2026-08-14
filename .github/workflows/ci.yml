@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: sudo apt-get update && sudo apt-get install -y shellcheck rsync dpkg-dev python3
+
+      - name: Smoke tests
+        run: bash tests/smoke.sh
+
+      - name: Build .deb
+        run: ./build-deb.sh
+
+      - name: Inspect package
+        run: dpkg-deb -I dist/nitro-control_*.deb
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nitro-control-deb
+          path: dist/*.deb

@@ -173,9 +173,21 @@ cmd_install_nbfc() {
   local ver="0.5.2"
   local url="https://github.com/nbfc-linux/nbfc-linux/releases/download/${ver}/debian-trixie-nbfc-linux_${ver}_amd64.deb"
   local deb="/tmp/nbfc-linux_${ver}_amd64.deb"
-  echo "[*] Yuklanmoqda (har qanday Kali/Debian): $url"
+  echo "[*] Yuklanmoqda (HTTPS): $url"
   command -v curl >/dev/null || die "curl kerak: apt install curl"
-  curl -fsSL -o "$deb" "$url"
+  curl -fsSL --proto '=https' --tlsv1.2 -o "$deb" "$url"
+
+  # Yaxlitlik tekshiruvi: haqiqiy Debian paketimi + SHA256 (supply-chain himoyasi)
+  dpkg-deb -I "$deb" >/dev/null 2>&1 || { rm -f "$deb"; die "yuklangan fayl haqiqiy .deb emas — bekor qilindi"; }
+  local sum
+  sum=$(sha256sum "$deb" | awk '{print $1}')
+  echo "[*] SHA256: $sum"
+  if [[ -n "${NBFC_SHA256:-}" ]]; then
+    [[ "$sum" == "${NBFC_SHA256}" ]] || { rm -f "$deb"; die "SHA256 mos kelmadi — o’rnatish to’xtatildi (kutilgan: ${NBFC_SHA256})"; }
+    echo "[+] SHA256 tasdiqlandi (pinned)."
+  else
+    echo "    (Ixtiyoriy pin: NBFC_SHA256=<hash> sudo -E nitro-fan install-nbfc)"
+  fi
   echo "[*] O’rnatilmoqda..."
   dpkg -i "$deb" || apt-get install -f -y
   have_nbfc || die "nbfc o’rnatilmadi"

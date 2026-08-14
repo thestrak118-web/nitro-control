@@ -1,4 +1,6 @@
 dist/
+releases/
+*.deb
 **/__pycache__/
 *.pyc
 *.ko

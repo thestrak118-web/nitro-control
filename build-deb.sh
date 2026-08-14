@@ -2,7 +2,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NAME="nitro-control"
-VERSION="3.0.0"
+# Single source of truth for the version: the VERSION file.
+VERSION="$(tr -d ' \t\n\r' < "$ROOT/VERSION")"
+[[ -n "$VERSION" ]] || { echo "VERSION fayli bo'sh yoki yo'q" >&2; exit 1; }
 ARCH="all"
 OUT_DIR="${1:-$ROOT/dist}"
 PKG_DIR="$OUT_DIR/${NAME}_${VERSION}_${ARCH}"
@@ -11,12 +13,19 @@ rm -rf "$PKG_DIR"
 mkdir -p "$PKG_DIR"
 rsync -a \
   --exclude 'dist' \
+  --exclude 'releases' \
   --exclude 'build-deb.sh' \
+  --exclude 'VERSION' \
+  --exclude 'tests' \
+  --exclude '.github' \
   --exclude '*.deb' \
   --exclude '.git' \
   --exclude '__pycache__' \
   --exclude '*.pyc' \
   "$ROOT/" "$PKG_DIR/"
+
+# Keep the packaged control's Version in sync with the VERSION file.
+sed -i "s/^Version:.*/Version: $VERSION/" "$PKG_DIR/DEBIAN/control"
 
 # doc dir name matches old path still fine; also symlink name for package
 mkdir -p "$PKG_DIR/usr/share/doc/nitro-control"

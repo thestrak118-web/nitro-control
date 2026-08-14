@@ -349,12 +349,13 @@ def list_display_outputs() -> List[Tuple[str, str, str, str]]:
 
 
 def nitro_fan_path() -> Optional[str]:
-    """Locate the nitro-fan CLI (PATH, then sibling of this script)."""
-    exe = shutil.which("nitro-fan")
-    if exe:
-        return exe
+    """Locate the nitro-fan CLI. Prefer the sibling next to this script so a
+    dev checkout and an installed package each use their co-located binary
+    (avoids the GUI calling a stale installed CLI)."""
     sib = Path(sys.argv[0]).resolve().parent / "nitro-fan"
-    return str(sib) if sib.exists() else None
+    if sib.exists():
+        return str(sib)
+    return shutil.which("nitro-fan")
 
 
 def display_action(mode: str, pos: str = "right") -> Tuple[bool, str]:
@@ -372,18 +373,25 @@ def display_action(mode: str, pos: str = "right") -> Tuple[bool, str]:
     return p.returncode == 0, msg or mode
 
 
-def display_fix() -> Tuple[bool, str]:
-    """Run driver auto-fix with graphical elevation (pkexec)."""
+def display_fix(allow_install: bool = False) -> Tuple[bool, str]:
+    """Run driver auto-fix with graphical elevation (pkexec).
+
+    Returns the FULL output so the caller can decide whether a (destructive)
+    package install is needed. Package installation only happens when
+    allow_install=True, i.e. after the user explicitly confirms.
+    """
     exe = nitro_fan_path()
     if not exe:
         return False, "nitro-fan topilmadi"
-    if shutil.which("pkexec"):
-        p = run_cmd(["pkexec", exe, "display", "fix"], timeout=240)
-        msg = (p.stdout or p.stderr or "").strip()
-        if msg:
-            msg = msg.splitlines()[-1]
-        return p.returncode == 0, msg or "fix bajarildi"
-    return False, "Terminalda ishga tushiring: sudo nitro-fan display fix"
+    tail = ["display", "fix"] + (["--yes"] if allow_install else [])
+    if not shutil.which("pkexec"):
+        return False, "pkexec yo'q. Terminalda: sudo nitro-fan display fix"
+    p = run_cmd(["pkexec", exe, *tail], timeout=300)
+    if p.returncode == 126:
+        return False, "Ruxsat berilmadi (polkit bekor qilindi yoki agent yo'q)"
+    if p.returncode == 127:
+        return False, "pkexec ishga tushmadi (polkit agenti yo'qmi?)"
+    return p.returncode == 0, (p.stdout or p.stderr or "").strip()
 
 
 # ── Widgets ────────────────────────────────────────────────────────────────
@@ -846,12 +854,33 @@ class NitroFanWindow(QMainWindow):
         self.refresh_displays()
 
     def on_display_fix(self):
-        self.set_status("Drayver tuzatilmoqda… (parol so'ralishi mumkin)", True)
+        self.set_status("Drayver tekshirilmoqda… (parol so'ralishi mumkin)", True)
         self._applying = True
-        ok, msg = display_fix()
+        ok, out = display_fix(allow_install=False)
         self._applying = False
-        self.set_status(msg, ok)
-        QMessageBox.information(self, "Ekran — tuzatish", msg or "bajarildi")
+
+        # Xavfsiz bosqich paket o'rnatishni tavsiya qilsa — foydalanuvchidan
+        # aniq tasdiq so'raymiz (tizimni o'zgartiruvchi amal jimgina bajarilmaydi).
+        if "fix --yes" in out or "o'rnatilmagan" in out:
+            resp = QMessageBox.question(
+                self,
+                "Drayver o'rnatish",
+                "Kerakli drayver/paket o'rnatilmagan:\n\n"
+                + out.strip()[-600:]
+                + "\n\nHozir o'rnatilsinmi? Tizim o'zgaradi va reboot kerak "
+                "bo'lishi mumkin.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if resp == QMessageBox.Yes:
+                self.set_status("Paket o'rnatilmoqda…", True)
+                self._applying = True
+                ok, out = display_fix(allow_install=True)
+                self._applying = False
+
+        last = out.splitlines()[-1] if out.strip() else ("bajarildi" if ok else "xato")
+        self.set_status(last, ok)
+        QMessageBox.information(self, "Ekran — tuzatish", (out.strip()[-800:]) or "bajarildi")
         self.refresh_displays()
 
     def _update_preview(self):

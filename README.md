@@ -18,7 +18,7 @@ Originally built for **Acer Nitro AN515-57**, then generalized for all Kali inst
 
 ```bash
 # Download the .deb from Releases, then:
-sudo dpkg -i nitro-control_3.0.0_all.deb
+sudo dpkg -i nitro-control_3.0.1_all.deb
 sudo apt-get install -f -y
 
 nitro-fan probe      # detect model & capabilities
@@ -123,7 +123,7 @@ nitro-fan probe
 
 ```bash
 ./build-deb.sh
-# → dist/nitro-control_3.0.0_all.deb
+# → dist/nitro-control_3.0.1_all.deb
 ```
 
 Prebuilt package also under `releases/`.
