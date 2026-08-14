@@ -1,6 +1,6 @@
 # nitro-control
 
-**Universal Kali Linux laptop control** — fan, keyboard RGB (Acer gaming), and system monitor (temp / RAM / SSD).
+**Universal Kali Linux laptop control** — fan, keyboard RGB (Acer gaming), external display / HDMI, and system monitor (temp / RAM / SSD).
 
 Works on **any Kali** (or Debian) laptop:
 
@@ -18,7 +18,7 @@ Originally built for **Acer Nitro AN515-57**, then generalized for all Kali inst
 
 ```bash
 # Download the .deb from Releases, then:
-sudo dpkg -i nitro-control_2.0.0_all.deb
+sudo dpkg -i nitro-control_3.0.0_all.deb
 sudo apt-get install -f -y
 
 nitro-fan probe      # detect model & capabilities
@@ -50,6 +50,26 @@ sudo nitro-fan set 50           # manual %
 sudo nitro-fan install-rgb      # Acer Nitro/Predator RGB kernel module
 sudo nitro-fan grub             # useful kernel params (Acer)
 ```
+
+### External display / HDMI
+
+Detects connected monitors, shows which GPU each output belongs to
+(on hybrid laptops HDMI is often wired to the NVIDIA GPU), applies the
+layout, and can auto-fix a missing/unloaded driver.
+
+```bash
+nitro-fan display               # list outputs + GPU/driver, connection state
+nitro-fan display extend right  # extend external (right|left|above|below)
+nitro-fan display mirror        # mirror internal to external
+nitro-fan display external      # external only
+nitro-fan display internal      # internal only
+nitro-fan display auto          # external connected → extend, else internal
+nitro-fan display watch         # real-time: auto-apply on hotplug
+sudo nitro-fan display fix       # diagnose & fix driver/module (NVIDIA modeset, firmware)
+```
+
+Backend auto-selected: GNOME → `gdctl`, KDE → `kscreen-doctor`,
+wlroots → `wlr-randr`, X11 → `xrandr`.
 
 ### RGB CLI (after install-rgb)
 
@@ -103,7 +123,7 @@ nitro-fan probe
 
 ```bash
 ./build-deb.sh
-# → dist/nitro-control_2.0.0_all.deb
+# → dist/nitro-control_3.0.0_all.deb
 ```
 
 Prebuilt package also under `releases/`.

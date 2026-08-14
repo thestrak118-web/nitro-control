@@ -13,6 +13,18 @@ case "$1" in
       gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
     fi
 
+    # RGB device permissions: load our udev rule and apply to existing nodes
+    # so the (non-root) GUI can drive keyboard RGB without a reboot.
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm control --reload-rules 2>/dev/null || true
+      udevadm trigger --sysname-match='acer-gkbbl*' 2>/dev/null || true
+    fi
+    for dev in /dev/acer-gkbbl*; do
+      [ -e "$dev" ] || continue
+      chgrp plugdev "$dev" 2>/dev/null || true
+      chmod 660 "$dev" 2>/dev/null || true
+    done
+
     MANUFACTURER=""; PRODUCT=""; NBFC_CONFIG=""; FAN_SUPPORTED=0
     RGB_SUPPORTED=0; PROFILE="monitor_only"; IS_ACER=0
     if [[ -x "$DETECT" ]]; then

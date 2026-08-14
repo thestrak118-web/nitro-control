@@ -1,0 +1,4 @@
+# nitro-control — Acer keyboard RGB character devices.
+# Grant the `plugdev` group read/write so the GUI can drive RGB without root.
+KERNEL=="acer-gkbbl*", SUBSYSTEM=="acer-gkbbl", GROUP="plugdev", MODE="0660"
+KERNEL=="acer-gkbbl*", GROUP="plugdev", MODE="0660"

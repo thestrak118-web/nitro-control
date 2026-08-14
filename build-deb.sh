@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NAME="nitro-control"
-VERSION="2.0.0"
+VERSION="3.0.0"
 ARCH="all"
 OUT_DIR="${1:-$ROOT/dist}"
 PKG_DIR="$OUT_DIR/${NAME}_${VERSION}_${ARCH}"
@@ -26,7 +26,11 @@ chmod 755 "$PKG_DIR/DEBIAN"
 chmod 755 "$PKG_DIR/DEBIAN/postinst" "$PKG_DIR/DEBIAN/prerm" "$PKG_DIR/DEBIAN/postrm" 2>/dev/null || true
 chmod 755 "$PKG_DIR/usr/bin/nitro-fan" "$PKG_DIR/usr/bin/nitro-fan-gui"
 chmod 755 "$PKG_DIR/usr/lib/nitro-control/hw-detect.sh"
+chmod 755 "$PKG_DIR/usr/lib/nitro-control/display.sh"
 find "$PKG_DIR/usr/share" -type f -exec chmod 644 {} \;
+if [[ -f "$PKG_DIR/usr/lib/udev/rules.d/99-nitro-control.rules" ]]; then
+  chmod 644 "$PKG_DIR/usr/lib/udev/rules.d/99-nitro-control.rules"
+fi
 
 SIZE=$(du -sk "$PKG_DIR" | cut -f1)
 if grep -q '^Installed-Size:' "$PKG_DIR/DEBIAN/control"; then

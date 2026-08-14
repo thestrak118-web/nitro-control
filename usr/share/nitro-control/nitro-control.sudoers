@@ -1,0 +1,5 @@
+# Optional: let members of `plugdev` control fans via nbfc without a password,
+# so the GUI can set fan speed / thermal-boost without running as root.
+# Installed to /etc/sudoers.d/nitro-control by `sudo nitro-fan install-rgb`
+# (or copy manually). Uses NOPASSWD only for the nbfc binary.
+%plugdev ALL=(root) NOPASSWD: /usr/bin/nbfc

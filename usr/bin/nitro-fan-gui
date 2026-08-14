@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nitro Control — Acer Nitro AN515-57 Fan + Keyboard RGB GUI."""
+"""Nitro Control — universal Kali laptop Fan + Keyboard RGB + monitor GUI."""
 from __future__ import annotations
 
 import os
@@ -57,17 +57,36 @@ TRACK = "#2a3544"
 
 DEV_DYN = "/dev/acer-gkbbl-0"
 DEV_STATIC = "/dev/acer-gkbbl-static-0"
-RGB_CLI = "/usr/local/bin/nitro-rgb"
-if not os.path.isfile(RGB_CLI):
-    RGB_CLI = "/opt/turbo-fan/facer_rgb.py"
-if not os.path.isfile(RGB_CLI):
-    RGB_CLI = str(Path.home() / "loyiha/acer-predator-rgb/facer_rgb.py")
+
+RGB_PERM_HINT = (
+    "RGB uchun ruxsat yo'q — terminal: sudo nitro-fan install-rgb "
+    "(udev qoidasi + plugdev), so'ng qayta kiring yoki reboot."
+)
 
 
 def run_cmd(args: List[str], timeout: float = 8.0) -> subprocess.CompletedProcess:
     return subprocess.run(
         args, capture_output=True, text=True, timeout=timeout, check=False
     )
+
+
+def run_nbfc(args: List[str], timeout: float = 8.0) -> subprocess.CompletedProcess:
+    """Run `nbfc <args>`, retrying via `sudo -n` if it fails on permissions.
+
+    On machines where the nbfc service socket is root-only, plain calls fail;
+    a passwordless sudoers rule (see install docs) then makes control work
+    without launching the whole GUI as root.
+    """
+    p = run_cmd(["nbfc", *args], timeout)
+    if p.returncode != 0 and _looks_like_perm_error(p):
+        if shutil.which("sudo"):
+            p = run_cmd(["sudo", "-n", "nbfc", *args], timeout)
+    return p
+
+
+def _looks_like_perm_error(p: subprocess.CompletedProcess) -> bool:
+    blob = f"{p.stdout}\n{p.stderr}".lower()
+    return any(k in blob for k in ("permission", "denied", "root", "eacces"))
 
 
 @dataclass
@@ -218,14 +237,18 @@ def fetch_status() -> Status:
 
 
 def nbfc_set_auto() -> Tuple[bool, str]:
-    p = run_cmd(["nbfc", "set", "-a"])
+    p = run_nbfc(["set", "-a"])
     if p.returncode != 0:
-        p = run_cmd(["nbfc", "set", "--auto"])
+        p = run_nbfc(["set", "--auto"])
+    if p.returncode != 0 and _looks_like_perm_error(p):
+        return False, "nbfc uchun ruxsat yo'q — sudoers qoidasi kerak (INSTALL.md)"
     return p.returncode == 0, (p.stderr or p.stdout or "").strip()
 
 
 def nbfc_set_speed(percent: int) -> Tuple[bool, str]:
-    p = run_cmd(["nbfc", "set", "-s", str(int(percent))])
+    p = run_nbfc(["set", "-s", str(int(percent))])
+    if p.returncode != 0 and _looks_like_perm_error(p):
+        return False, "nbfc uchun ruxsat yo'q — sudoers qoidasi kerak (INSTALL.md)"
     return p.returncode == 0, (p.stderr or p.stdout or "").strip()
 
 
@@ -253,6 +276,8 @@ def set_static_color(r: int, g: int, b: int, brightness: int = 100) -> Tuple[boo
         with open(DEV_DYN, "wb") as cd:
             cd.write(bytes(dyn))
         return True, f"RGB: #{r:02X}{g:02X}{b:02X}  b={brightness}"
+    except PermissionError:
+        return False, RGB_PERM_HINT
     except Exception as e:
         return False, str(e)
 
@@ -285,8 +310,80 @@ def set_effect(
             cd.write(bytes(payload))
         names = {1: "Breath", 2: "Neon", 3: "Wave", 4: "Shift", 5: "Zoom"}
         return True, f"Effekt: {names.get(mode, mode)}"
+    except PermissionError:
+        return False, RGB_PERM_HINT
     except Exception as e:
         return False, str(e)
+
+
+# ── Display / external monitor ───────────────────────────────────────────────
+DRM_PATH = "/sys/class/drm"
+
+
+def _is_internal_conn(conn: str) -> bool:
+    return conn.startswith(("eDP", "LVDS", "DSI", "DPI"))
+
+
+def list_display_outputs() -> List[Tuple[str, str, str, str]]:
+    """Driverless: read /sys/class/drm. Return (connector, status, card, driver)."""
+    out: List[Tuple[str, str, str, str]] = []
+    base = Path(DRM_PATH)
+    if not base.exists():
+        return out
+    for status_file in sorted(base.glob("card*-*/status")):
+        name = status_file.parent.name  # e.g. card1-HDMI-A-1
+        if "-" not in name:
+            continue
+        card, conn = name.split("-", 1)
+        try:
+            status = status_file.read_text().strip()
+        except Exception:
+            status = "?"
+        drv = "-"
+        try:
+            drv = os.path.basename(os.path.realpath(f"{DRM_PATH}/{card}/device/driver"))
+        except Exception:
+            pass
+        out.append((conn, status, card, drv))
+    return out
+
+
+def nitro_fan_path() -> Optional[str]:
+    """Locate the nitro-fan CLI (PATH, then sibling of this script)."""
+    exe = shutil.which("nitro-fan")
+    if exe:
+        return exe
+    sib = Path(sys.argv[0]).resolve().parent / "nitro-fan"
+    return str(sib) if sib.exists() else None
+
+
+def display_action(mode: str, pos: str = "right") -> Tuple[bool, str]:
+    """Run `nitro-fan display <mode>` (extend/mirror/external/internal/auto)."""
+    exe = nitro_fan_path()
+    if not exe:
+        return False, "nitro-fan topilmadi"
+    args = [exe, "display", mode]
+    if mode == "extend":
+        args.append(pos)
+    p = run_cmd(args, timeout=20)
+    msg = (p.stdout or p.stderr or "").strip()
+    if msg:
+        msg = msg.splitlines()[-1]
+    return p.returncode == 0, msg or mode
+
+
+def display_fix() -> Tuple[bool, str]:
+    """Run driver auto-fix with graphical elevation (pkexec)."""
+    exe = nitro_fan_path()
+    if not exe:
+        return False, "nitro-fan topilmadi"
+    if shutil.which("pkexec"):
+        p = run_cmd(["pkexec", exe, "display", "fix"], timeout=240)
+        msg = (p.stdout or p.stderr or "").strip()
+        if msg:
+            msg = msg.splitlines()[-1]
+        return p.returncode == 0, msg or "fix bajarildi"
+    return False, "Terminalda ishga tushiring: sudo nitro-fan display fix"
 
 
 # ── Widgets ────────────────────────────────────────────────────────────────
@@ -440,6 +537,7 @@ class NitroFanWindow(QMainWindow):
         tabs.setObjectName("tabs")
         tabs.addTab(self._build_fan_tab(), "  🌡  FAN  ")
         tabs.addTab(self._build_rgb_tab(), "  💡  KLAVIATURA RGB  ")
+        tabs.addTab(self._build_display_tab(), "  🖥  EKRAN  ")
         layout.addWidget(tabs, 1)
 
         self.status_bar = QLabel("Tayyor")
@@ -643,6 +741,119 @@ class NitroFanWindow(QMainWindow):
         layout.addStretch()
         return w
 
+    def _build_display_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 10, 4, 4)
+        layout.setSpacing(12)
+
+        # Live monitor list
+        list_card = Card()
+        ll = QVBoxLayout(list_card)
+        ll.setContentsMargins(16, 12, 16, 12)
+        ll.setSpacing(8)
+        head = QLabel("Ulangan ekranlar (real vaqtda):")
+        head.setObjectName("info")
+        ll.addWidget(head)
+        self.lbl_displays = QLabel("—")
+        self.lbl_displays.setObjectName("displays")
+        self.lbl_displays.setTextFormat(Qt.PlainText)
+        ll.addWidget(self.lbl_displays)
+        self.lbl_display_hint = QLabel("")
+        self.lbl_display_hint.setObjectName("info")
+        ll.addWidget(self.lbl_display_hint)
+        layout.addWidget(list_card)
+
+        # Layout controls
+        ctrl = Card()
+        cl = QVBoxLayout(ctrl)
+        cl.setContentsMargins(16, 14, 16, 14)
+        cl.setSpacing(10)
+
+        pos_row = QHBoxLayout()
+        pos_row.addWidget(QLabel("Tashqi ekran joyi:"))
+        self.cmb_pos = QComboBox()
+        self.cmb_pos.addItem("O'ngda", "right")
+        self.cmb_pos.addItem("Chapda", "left")
+        self.cmb_pos.addItem("Tepada", "above")
+        self.cmb_pos.addItem("Pastda", "below")
+        pos_row.addWidget(self.cmb_pos)
+        pos_row.addStretch()
+        cl.addLayout(pos_row)
+
+        row1 = QHBoxLayout()
+        self.btn_d_extend = PillButton("KENGAYTIRISH", "primary")
+        self.btn_d_mirror = PillButton("MIRROR", "secondary")
+        self.btn_d_ext = PillButton("FAQAT TASHQI", "secondary")
+        self.btn_d_int = PillButton("FAQAT ICHKI", "secondary")
+        self.btn_d_extend.clicked.connect(
+            lambda: self.on_display("extend", self.cmb_pos.currentData())
+        )
+        self.btn_d_mirror.clicked.connect(lambda: self.on_display("mirror"))
+        self.btn_d_ext.clicked.connect(lambda: self.on_display("external"))
+        self.btn_d_int.clicked.connect(lambda: self.on_display("internal"))
+        for b in (self.btn_d_extend, self.btn_d_mirror, self.btn_d_ext, self.btn_d_int):
+            row1.addWidget(b)
+        cl.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.btn_d_auto = PillButton("AVTO", "accent")
+        self.btn_d_fix = PillButton("TUZATISH (drayver)", "danger")
+        self.btn_d_refresh = PillButton("YANGILASH", "ghost")
+        self.btn_d_auto.clicked.connect(lambda: self.on_display("auto"))
+        self.btn_d_fix.clicked.connect(self.on_display_fix)
+        self.btn_d_refresh.clicked.connect(self.refresh_displays)
+        for b in (self.btn_d_auto, self.btn_d_fix, self.btn_d_refresh):
+            row2.addWidget(b)
+        cl.addLayout(row2)
+
+        tip = QLabel(
+            "HDMI ko'pincha NVIDIA GPU'ga ulanadi — ishlamasa 'TUZATISH' "
+            "drayver/modulni avtomatik yuklaydi. Ekran ulanishi real vaqtda kuzatiladi."
+        )
+        tip.setObjectName("tip")
+        tip.setWordWrap(True)
+        cl.addWidget(tip)
+        layout.addWidget(ctrl)
+        layout.addStretch()
+        return w
+
+    def refresh_displays(self):
+        outs = list_display_outputs()
+        lines: List[str] = []
+        ext_connected: Optional[str] = None
+        for conn, status, card, drv in outs:
+            tag = " (ichki)" if _is_internal_conn(conn) else ""
+            mark = "●" if status == "connected" else "○"
+            lines.append(f"{mark} {conn:<12} {status:<12} {card:<6} {drv}{tag}")
+            if status == "connected" and not _is_internal_conn(conn):
+                ext_connected = conn
+        self.lbl_displays.setText("\n".join(lines) if lines else "chiqish topilmadi")
+        if ext_connected:
+            self.lbl_display_hint.setText(f"Tashqi ekran ULANGAN: {ext_connected}")
+            self.lbl_display_hint.setStyleSheet(f"color:{ACCENT}; font-weight:700;")
+        else:
+            self.lbl_display_hint.setText("Tashqi ekran ulanmagan")
+            self.lbl_display_hint.setStyleSheet(f"color:{MUTED};")
+
+    def on_display(self, mode: str, pos: str = "right"):
+        self._applying = True
+        ok, msg = display_action(mode, pos)
+        self._applying = False
+        self.set_status(msg, ok)
+        if not ok:
+            QMessageBox.warning(self, "Ekran", msg or "amal bajarilmadi")
+        self.refresh_displays()
+
+    def on_display_fix(self):
+        self.set_status("Drayver tuzatilmoqda… (parol so'ralishi mumkin)", True)
+        self._applying = True
+        ok, msg = display_fix()
+        self._applying = False
+        self.set_status(msg, ok)
+        QMessageBox.information(self, "Ekran — tuzatish", msg or "bajarildi")
+        self.refresh_displays()
+
     def _update_preview(self):
         c = self._color
         self.preview.setStyleSheet(
@@ -719,6 +930,17 @@ class NitroFanWindow(QMainWindow):
             QLabel#info {{ color: {MUTED}; font-size: 12px; }}
             QLabel#slider_label {{ font-weight: 600; color: {TEXT}; }}
             QLabel#tip {{ color: {MUTED}; font-size: 11px; }}
+            QLabel#displays {{
+                font-family: 'JetBrains Mono', 'DejaVu Sans Mono', monospace;
+                font-size: 12px; color: {TEXT}; line-height: 150%;
+            }}
+            QComboBox {{
+                background: {PANEL2}; color: {TEXT}; border: 1px solid {BORDER};
+                border-radius: 8px; padding: 6px 10px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {PANEL2}; color: {TEXT}; selection-background-color: {ACCENT2};
+            }}
             QLabel#alert {{
                 background: #3a1515; color: {HOT}; border: 1px solid {HOT};
                 border-radius: 10px; padding: 8px 12px; font-weight: 700; font-size: 12px;
@@ -889,6 +1111,7 @@ class NitroFanWindow(QMainWindow):
             self.lbl_nvme.setText("SSD: —")
 
         self._handle_alerts(st)
+        self.refresh_displays()
 
         if st.error:
             self.set_status(st.error, ok=False)

@@ -4,6 +4,12 @@
 set -euo pipefail
 
 DETECT="/usr/lib/nitro-control/hw-detect.sh"
+DISPLAY_HELPER="/usr/lib/nitro-control/display.sh"
+# dev fallback: repo ichidan ishga tushirilganda
+if [[ ! -f "$DISPLAY_HELPER" ]]; then
+  _self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [[ -f "$_self_dir/../lib/nitro-control/display.sh" ]] && DISPLAY_HELPER="$_self_dir/../lib/nitro-control/display.sh"
+fi
 SERVICE="nbfc_service"
 NBFC_BIN="${NBFC_BIN:-/usr/bin/nbfc}"
 
@@ -184,6 +190,32 @@ cmd_install_nbfc() {
   fi
 }
 
+setup_rgb_perms() {
+  # Make RGB usable from the (non-root) GUI: udev group access + optional
+  # passwordless nbfc for fan control. Idempotent; safe to re-run.
+  local rules="/usr/lib/udev/rules.d/99-nitro-control.rules"
+  if [[ -f "$rules" ]]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --sysname-match='acer-gkbbl*' 2>/dev/null || true
+  fi
+  # Apply to any device that already exists, without waiting for a reboot.
+  local dev
+  for dev in /dev/acer-gkbbl*; do
+    [[ -e "$dev" ]] || continue
+    chgrp plugdev "$dev" 2>/dev/null || true
+    chmod 660 "$dev" 2>/dev/null || true
+  done
+  # Optional sudoers for fan control from the GUI (validated before install).
+  local src="/usr/share/nitro-control/nitro-control.sudoers"
+  local dst="/etc/sudoers.d/nitro-control"
+  if [[ -f "$src" && ! -f "$dst" ]]; then
+    if visudo -cf "$src" >/dev/null 2>&1; then
+      install -m 440 "$src" "$dst"
+      echo "[+] sudoers: plugdev -> nbfc (parolsiz fan boshqaruvi)"
+    fi
+  fi
+}
+
 cmd_install_rgb() {
   need_root "install-rgb"
   load_hw
@@ -192,6 +224,7 @@ cmd_install_rgb() {
   fi
   if [[ ${RGB_DEV:-0} -eq 1 ]]; then
     echo "RGB allaqachon tayyor (/dev/acer-gkbbl-0)"
+    setup_rgb_perms
     return 0
   fi
   local dir="/opt/turbo-fan"
@@ -219,6 +252,7 @@ cmd_install_rgb() {
     cp -f facer_rgb.py /usr/local/bin/nitro-rgb
     chmod 755 /usr/local/bin/nitro-rgb
   fi
+  setup_rgb_perms
   echo "RGB o’rnatildi. Tekshirish: ls -l /dev/acer-gkbbl-0"
   ls -l /dev/acer-gkbbl* 2>/dev/null || echo "Reboot yoki: systemctl restart turbo-fan"
 }
@@ -275,6 +309,7 @@ Buyruqlar:
   sudo nitro-fan enable         Fan config + service
   sudo nitro-fan auto|max|set N Fan boshqaruvi
   sudo nitro-fan install-rgb    Acer RGB modul (faqat Acer gaming)
+  nitro-fan display [...]       Tashqi ekran/HDMI boshqaruvi (extend/mirror/watch/fix)
   sudo nitro-fan grub           Foydali kernel parametrlari
   nitro-fan-gui                 Grafik interfeys
 
@@ -297,6 +332,9 @@ main() {
     enable|e)         cmd_enable ;;
     install-nbfc|in)  cmd_install_nbfc ;;
     install-rgb|ir)   cmd_install_rgb ;;
+    display|screen|disp|d)
+                      [[ -f "$DISPLAY_HELPER" ]] || die "display helper topilmadi: $DISPLAY_HELPER"
+                      exec bash "$DISPLAY_HELPER" "$@" ;;
     grub|g)           cmd_grub ;;
     -h|--help|help)   usage ;;
     *)                usage; die "noma’lum buyruq: $cmd" ;;
