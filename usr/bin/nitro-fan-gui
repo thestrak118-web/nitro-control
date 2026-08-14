@@ -772,52 +772,49 @@ class NitroFanWindow(QMainWindow):
         ll.addWidget(self.lbl_display_hint)
         layout.addWidget(list_card)
 
-        # Layout controls
+        # Layout controls — bitta "Rejim" ro'yxati + QO'LLASH (ortiqcha tugmalarsiz)
         ctrl = Card()
         cl = QVBoxLayout(ctrl)
         cl.setContentsMargins(16, 14, 16, 14)
         cl.setSpacing(10)
 
-        pos_row = QHBoxLayout()
-        pos_row.addWidget(QLabel("Tashqi ekran joyi:"))
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Rejim:"))
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItem("Kengaytirish", "extend")
+        self.cmb_mode.addItem("Mirror (nusxa)", "mirror")
+        self.cmb_mode.addItem("Faqat tashqi", "external")
+        self.cmb_mode.addItem("Faqat ichki", "internal")
+        mode_row.addWidget(self.cmb_mode, 1)
         self.cmb_pos = QComboBox()
         self.cmb_pos.addItem("O'ngda", "right")
         self.cmb_pos.addItem("Chapda", "left")
         self.cmb_pos.addItem("Tepada", "above")
         self.cmb_pos.addItem("Pastda", "below")
-        pos_row.addWidget(self.cmb_pos)
-        pos_row.addStretch()
-        cl.addLayout(pos_row)
-
-        row1 = QHBoxLayout()
-        self.btn_d_extend = PillButton("KENGAYTIRISH", "primary")
-        self.btn_d_mirror = PillButton("MIRROR", "secondary")
-        self.btn_d_ext = PillButton("FAQAT TASHQI", "secondary")
-        self.btn_d_int = PillButton("FAQAT ICHKI", "secondary")
-        self.btn_d_extend.clicked.connect(
-            lambda: self.on_display("extend", self.cmb_pos.currentData())
+        mode_row.addWidget(self.cmb_pos)
+        self.btn_d_apply = PillButton("QO'LLASH", "primary")
+        self.btn_d_apply.setFixedWidth(130)
+        self.btn_d_apply.clicked.connect(self.on_display_apply)
+        mode_row.addWidget(self.btn_d_apply)
+        cl.addLayout(mode_row)
+        # Joy tanlash faqat "Kengaytirish"da mantiqiy
+        self.cmb_mode.currentIndexChanged.connect(
+            lambda: self.cmb_pos.setEnabled(self.cmb_mode.currentData() == "extend")
         )
-        self.btn_d_mirror.clicked.connect(lambda: self.on_display("mirror"))
-        self.btn_d_ext.clicked.connect(lambda: self.on_display("external"))
-        self.btn_d_int.clicked.connect(lambda: self.on_display("internal"))
-        for b in (self.btn_d_extend, self.btn_d_mirror, self.btn_d_ext, self.btn_d_int):
-            row1.addWidget(b)
-        cl.addLayout(row1)
 
         row2 = QHBoxLayout()
         self.btn_d_auto = PillButton("AVTO", "accent")
         self.btn_d_fix = PillButton("TUZATISH (drayver)", "danger")
-        self.btn_d_refresh = PillButton("YANGILASH", "ghost")
         self.btn_d_auto.clicked.connect(lambda: self.on_display("auto"))
         self.btn_d_fix.clicked.connect(self.on_display_fix)
-        self.btn_d_refresh.clicked.connect(self.refresh_displays)
-        for b in (self.btn_d_auto, self.btn_d_fix, self.btn_d_refresh):
-            row2.addWidget(b)
+        row2.addWidget(self.btn_d_auto)
+        row2.addWidget(self.btn_d_fix)
         cl.addLayout(row2)
 
         tip = QLabel(
-            "HDMI ko'pincha NVIDIA GPU'ga ulanadi — ishlamasa 'TUZATISH' "
-            "drayver/modulni avtomatik yuklaydi. Ekran ulanishi real vaqtda kuzatiladi."
+            "AVTO — tashqi ekran ulansa avtomatik moslaydi. "
+            "HDMI ko'pincha NVIDIA'ga ulanadi; ishlamasa TUZATISH drayverni yuklaydi. "
+            "Ro'yxat real vaqtda yangilanadi."
         )
         tip.setObjectName("tip")
         tip.setWordWrap(True)
@@ -825,6 +822,11 @@ class NitroFanWindow(QMainWindow):
         layout.addWidget(ctrl)
         layout.addStretch()
         return w
+
+    def on_display_apply(self):
+        mode = self.cmb_mode.currentData()
+        pos = self.cmb_pos.currentData() if mode == "extend" else "right"
+        self.on_display(mode, pos)
 
     def refresh_displays(self):
         outs = list_display_outputs()
