@@ -112,7 +112,16 @@ class Status:
     mem_used_gb: Optional[float] = None
     mem_total_gb: Optional[float] = None
     swap_percent: Optional[float] = None
+    swap_used_gb: Optional[float] = None
+    swap_total_gb: Optional[float] = None
     nvme_temp: Optional[float] = None
+    zram_percent: Optional[float] = None
+    zram_used_gb: Optional[float] = None
+    zram_total_gb: Optional[float] = None
+    zram_ratio: Optional[float] = None
+    disk_percent: Optional[float] = None
+    disk_used_gb: Optional[float] = None
+    disk_total_gb: Optional[float] = None
 
 
 def parse_nbfc_status(text: str) -> List[FanInfo]:
@@ -175,7 +184,7 @@ def parse_sensors() -> tuple[Optional[float], Optional[int], Optional[int], Opti
 
 
 def parse_memory() -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Return mem_percent, used_gb, total_gb, swap_percent."""
+    """Return mem_pct, used_gb, total_gb, swap_pct, swap_used_gb, swap_total_gb."""
     try:
         meminfo = Path("/proc/meminfo").read_text()
     except Exception:
@@ -199,7 +208,93 @@ def parse_memory() -> tuple[Optional[float], Optional[float], Optional[float], O
     st = vals.get("SwapTotal", 0)
     sf = vals.get("SwapFree", 0)
     swap_pct = 0.0 if st == 0 else 100.0 * (st - sf) / st
-    return mem_pct, used_gb, total_gb, swap_pct
+    swap_used_gb = (st - sf) / (1024 * 1024)
+    swap_total_gb = st / (1024 * 1024)
+    return mem_pct, used_gb, total_gb, swap_pct, swap_used_gb, swap_total_gb
+
+
+def parse_zram() -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """zram swap: (foiz, ishlatilgan_GB, umumiy_GB, siqilish_koeff)."""
+    import glob
+    used_b = 0
+    disk_b = 0
+    orig_b = 0
+    compr_b = 0
+    found = False
+    for dev in sorted(glob.glob("/sys/block/zram*")):
+        try:
+            ds = int(Path(dev + "/disksize").read_text().strip())
+        except Exception:
+            continue
+        if ds <= 0:
+            continue
+        found = True
+        disk_b += ds
+        try:
+            stat = Path(dev + "/mm_stat").read_text().split()
+            orig_b += int(stat[0])
+            compr_b += int(stat[1])
+            used_b += int(stat[2])
+        except Exception:
+            pass
+    if not found:
+        return None, None, None, None
+    pct = 100.0 * used_b / disk_b if disk_b else 0.0
+    used_gb = used_b / (1024 ** 3)
+    total_gb = disk_b / (1024 ** 3)
+    ratio = (orig_b / compr_b) if compr_b else None
+    return pct, used_gb, total_gb, ratio
+
+
+def parse_ec_rpm() -> tuple[Optional[int], Optional[int]]:
+    """EC RAM'dan haqiqiy fan RPM: (cpu_rpm, gpu_rpm).
+
+    nbfc 'Current Fan Speed' ni doim 100%% deb noto'g'ri o'qiydi; haqiqiy RPM
+    EC registrlarida: 0x13-0x14 (CPU), 0x15-0x16 (GPU), little-endian word.
+    `sudo -n ectool -d` orqali (sudoers NOPASSWD kerak).
+    """
+    try:
+        out = run_cmd(["sudo", "-n", "/usr/sbin/ectool", "-d"], timeout=4).stdout
+    except Exception:
+        return None, None
+    if not out:
+        return None, None
+    row = None
+    for line in out.splitlines():
+        if line.strip().startswith("10:"):
+            row = line.strip()
+            break
+    if not row:
+        return None, None
+    parts = row.split()[1:]
+    try:
+        b = [int(x, 16) for x in parts[:16]]
+    except ValueError:
+        return None, None
+    if len(b) < 7:
+        return None, None
+    cpu = b[3] | (b[4] << 8)
+    gpu = b[5] | (b[6] << 8)
+    cpu = cpu if 0 <= cpu <= 10000 else None
+    gpu = gpu if 0 <= gpu <= 10000 else None
+    return cpu, gpu
+
+
+def parse_disk() -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """/ diskining band foizi, band GB, umumiy GB (df uslubida)."""
+    try:
+        vfs = os.statvfs("/")
+    except Exception:
+        return None, None, None
+    total = vfs.f_blocks * vfs.f_frsize
+    avail = vfs.f_bavail * vfs.f_frsize
+    free = vfs.f_bfree * vfs.f_frsize
+    used = total - free
+    denom = used + avail
+    if denom <= 0:
+        return None, None, None
+    pct = 100.0 * used / denom
+    return pct, used / (1024 ** 3), total / (1024 ** 3)
 
 
 def fetch_status() -> Status:
@@ -211,7 +306,9 @@ def fetch_status() -> Status:
     except Exception:
         st.service_active = False
 
-    st.mem_percent, st.mem_used_gb, st.mem_total_gb, st.swap_percent = parse_memory()
+    (st.mem_percent, st.mem_used_gb, st.mem_total_gb,
+     st.swap_percent, st.swap_used_gb, st.swap_total_gb) = parse_memory()
+    st.zram_percent, st.zram_used_gb, st.zram_total_gb, st.zram_ratio = parse_zram()
 
     if not shutil.which("nbfc"):
         st.error = "nbfc topilmadi. Terminal: sudo nitro-fan install-nbfc"
@@ -233,6 +330,7 @@ def fetch_status() -> Status:
         st.error = str(e)
 
     st.cpu_temp, st.fan1_rpm, st.fan2_rpm, st.nvme_temp = parse_sensors()
+    st.disk_percent, st.disk_used_gb, st.disk_total_gb = parse_disk()
     return st
 
 
@@ -562,8 +660,8 @@ class NitroFanWindow(QMainWindow):
         g_layout = QGridLayout(gauges_card)
         g_layout.setContentsMargins(12, 12, 12, 6)
         self.g_cpu = GaugeWidget("CPU TEMP", "°C", 100)
-        self.g_cpu_fan = GaugeWidget("CPU FAN", "%", 100)
-        self.g_gpu_fan = GaugeWidget("GPU FAN", "%", 100)
+        self.g_cpu_fan = GaugeWidget("RAM", "%", 100)
+        self.g_gpu_fan = GaugeWidget("XOTIRA", "%", 100)
         self.g_mode = GaugeWidget("TARGET", "%", 100)
         g_layout.addWidget(self.g_cpu, 0, 0)
         g_layout.addWidget(self.g_cpu_fan, 0, 1)
@@ -585,7 +683,7 @@ class NitroFanWindow(QMainWindow):
         info_l.addWidget(self.lbl_mode)
         info_l.addStretch()
         info_l.addWidget(self.lbl_rpm)
-        layout.addWidget(info_card)
+        # Yuqori qator (Config/Rejim/RPM) yashirildi — ko'rsatilmaydi
 
         # System / warnings
         sys_card = Card()
@@ -597,13 +695,20 @@ class NitroFanWindow(QMainWindow):
         self.lbl_ram.setObjectName("info")
         self.lbl_swap = QLabel("Swap: —")
         self.lbl_swap.setObjectName("info")
+        self.lbl_zram = QLabel("zram: —")
+        self.lbl_zram.setObjectName("info")
+        _bigf = self.lbl_swap.font()
+        _bigf.setPointSize(_bigf.pointSize() + 4)
+        _bigf.setBold(True)
+        self.lbl_swap.setFont(QFont(_bigf))
+        self.lbl_zram.setFont(QFont(_bigf))
         self.lbl_nvme = QLabel("SSD: —")
         self.lbl_nvme.setObjectName("info")
-        row.addWidget(self.lbl_ram)
         row.addStretch()
         row.addWidget(self.lbl_swap)
         row.addStretch()
-        row.addWidget(self.lbl_nvme)
+        row.addWidget(self.lbl_zram)
+        row.addStretch()
         sys_l.addLayout(row)
         self.lbl_alert = QLabel("")
         self.lbl_alert.setObjectName("alert")
@@ -1090,26 +1195,21 @@ class NitroFanWindow(QMainWindow):
 
         cpu_fan = st.fans[0] if len(st.fans) > 0 else None
         gpu_fan = st.fans[1] if len(st.fans) > 1 else None
-        if cpu_fan:
-            self.g_cpu_fan.set_value(cpu_fan.current, f"→ {cpu_fan.target:.0f}%")
-        if gpu_fan:
-            self.g_gpu_fan.set_value(gpu_fan.current, f"→ {gpu_fan.target:.0f}%")
+        if st.mem_percent is not None:
+            self.g_cpu_fan.set_value(
+                st.mem_percent,
+                f"{st.mem_used_gb:.1f}/{st.mem_total_gb:.0f} GB",
+            )
+        if st.disk_percent is not None:
+            self.g_gpu_fan.set_value(
+                st.disk_percent,
+                f"{st.disk_used_gb:.0f}/{st.disk_total_gb:.0f} GB",
+            )
 
         target, auto = 0.0, False
         if cpu_fan:
             target, auto = cpu_fan.target, cpu_fan.auto
         self.g_mode.set_value(target, "AUTO" if auto else "MANUAL")
-
-        self.lbl_config.setText(f"Config: {st.config or '—'}")
-        self.lbl_mode.setText(
-            f"Rejim: {'AUTO (temp)' if auto else 'MANUAL'}"
-        )
-        rpm_parts = []
-        if st.fan1_rpm is not None:
-            rpm_parts.append(f"CPU {st.fan1_rpm}")
-        if st.fan2_rpm is not None:
-            rpm_parts.append(f"GPU {st.fan2_rpm}")
-        self.lbl_rpm.setText("RPM: " + (" · ".join(rpm_parts) if rpm_parts else "—"))
 
         # RAM / SSD labels
         if st.mem_percent is not None:
@@ -1123,13 +1223,30 @@ class NitroFanWindow(QMainWindow):
             else:
                 self.lbl_ram.setStyleSheet(f"color: {MUTED};")
         if st.swap_percent is not None:
-            self.lbl_swap.setText(f"Swap: {st.swap_percent:.0f}%")
+            if st.swap_total_gb:
+                self.lbl_swap.setText(
+                    f"Swap: {st.swap_percent:.0f}%  ({st.swap_used_gb:.1f}/{st.swap_total_gb:.0f} GB)"
+                )
+            else:
+                self.lbl_swap.setText(f"Swap: {st.swap_percent:.0f}%")
             if st.swap_percent >= 50:
                 self.lbl_swap.setStyleSheet(f"color: {HOT}; font-weight: 700;")
             elif st.swap_percent >= 20:
                 self.lbl_swap.setStyleSheet(f"color: {WARN}; font-weight: 700;")
             else:
-                self.lbl_swap.setStyleSheet(f"color: {MUTED};")
+                self.lbl_swap.setStyleSheet(f"color: {ACCENT}; font-weight: 700;")
+        if st.zram_percent is not None:
+            ratio = f"  {st.zram_ratio:.1f}x" if st.zram_ratio else ""
+            self.lbl_zram.setText(
+                f"zram: {st.zram_percent:.0f}%  ({st.zram_used_gb:.1f}/{st.zram_total_gb:.1f} GB{ratio})"
+            )
+            if st.zram_percent >= 80:
+                self.lbl_zram.setStyleSheet(f"color: {WARN}; font-weight: 700;")
+            else:
+                self.lbl_zram.setStyleSheet(f"color: {ACCENT}; font-weight: 700;")
+        else:
+            self.lbl_zram.setText("zram: yo'q")
+            self.lbl_zram.setStyleSheet(f"color: {MUTED};")
         if st.nvme_temp is not None:
             self.lbl_nvme.setText(f"SSD: {st.nvme_temp:.0f}°C")
             if st.nvme_temp >= 75:
